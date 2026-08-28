@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="pl">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="description" content="Pędzące żółwie — losowanie do odpowiedzi i ocenianie w klasie." />
+    <title>Pędzące żółwie — losowanie do odpowiedzi</title>
+    <link rel="stylesheet" href="styles.css?v=16" />
+    <script src="script.js?v=16" defer></script>
+  </head>
+  <body>
+    <div class="app">
+      <main class="game-area">
+        <div class="race-stage" id="lesson-stage">
+          <div class="lesson-start-light" id="lesson-start-light" aria-label="Sygnalizacja startowa">
+            <span data-start-light="orange-one"></span>
+            <span data-start-light="orange-two"></span>
+            <span data-start-light="yellow-three"></span>
+            <span data-start-light="green"></span>
+          </div>
+          <div class="pebble-track" id="pebble-track" aria-label="Tor z kamyczków">
+            <div class="pebble-turtles" id="pebble-turtles"></div>
+          </div>
+          <div class="pebble-winner" id="pebble-winner" hidden></div>
+          <button class="button button-primary lesson-random-button" id="lesson-random" type="button">Start</button>
+        </div>
+      </main>
+    </div>
+
+    <button class="menu-button" id="menu-button" type="button" aria-label="Otwórz menu" aria-expanded="false">
+      <span class="menu-button-icon" aria-hidden="true"></span>
+    </button>
+
+    <div class="menu-overlay" id="menu-overlay" hidden>
+      <div class="menu-backdrop" data-menu-backdrop></div>
+      <div class="menu-panel" role="dialog" aria-modal="true" aria-label="Menu">
+        <button class="menu-close" id="menu-close" type="button" aria-label="Zamknij menu">&times;</button>
+        <div class="menu-content">
+          <!-- Auth -->
+          <section class="side-card" id="auth-section">
+            <div class="tabs" role="tablist" aria-label="Logowanie i rejestracja">
+              <button class="tab is-active" data-auth-tab="login" type="button" role="tab">Logowanie</button>
+              <button class="tab" data-auth-tab="register" type="button" role="tab">Rejestracja</button>
+            </div>
+
+            <form class="auth-form" id="login-form">
+              <label for="login-username">Login</label>
+              <input id="login-username" name="login" type="text" autocomplete="username" />
+              <label for="login-password">Hasło</label>
+              <input id="login-password" name="password" type="password" autocomplete="current-password" />
+              <p class="form-error" id="login-error" role="alert" hidden></p>
+              <button class="button button-primary" type="submit">Zaloguj</button>
+            </form>
+
+            <form class="auth-form" id="register-form" hidden>
+              <label for="reg-role">Typ konta</label>
+              <select id="reg-role" name="role">
+                <option value="teacher">Nauczyciel</option>
+                <option value="student">Uczeń</option>
+              </select>
+              <div class="reg-teacher-only">
+                <label for="reg-class-name">Nazwa klasy</label>
+                <input id="reg-class-name" name="className" type="text" placeholder="np. 3A" />
+              </div>
+              <div class="reg-student-only" hidden>
+                <label for="reg-join-key">Klucz klasy (od nauczyciela)</label>
+                <input id="reg-join-key" name="joinKey" type="text" placeholder="np. 1A2B3C4D" />
+              </div>
+              <label for="reg-name">Imię i nazwisko</label>
+              <input id="reg-name" name="fullName" type="text" autocomplete="name" />
+              <label for="reg-login">Login</label>
+              <input id="reg-login" name="login" type="text" autocomplete="username" />
+              <label for="reg-password">Hasło</label>
+              <input id="reg-password" name="password" type="password" autocomplete="new-password" />
+              <label for="reg-confirm">Powtórz hasło</label>
+              <input id="reg-confirm" name="confirmPassword" type="password" autocomplete="new-password" />
+              <p class="form-hint">Minimum 8 znaków, mała i wielka litera oraz cyfra.</p>
+              <p class="form-error" id="register-error" role="alert" hidden></p>
+              <button class="button button-primary" type="submit">Załóż konto</button>
+            </form>
+          </section>
+
+          <!-- Account -->
+          <section class="side-card" id="account-section" hidden>
+            <div class="side-card-header">
+              <h2 id="account-name"></h2>
+              <span class="role-badge" id="account-role"></span>
+            </div>
+            <button class="button button-ghost button-block" id="logout-button" type="button">Wyloguj</button>
+          </section>
+
+          <!-- Teacher: class -->
+          <section class="side-card" id="teacher-class-section" hidden>
+            <div class="side-card-header">
+              <h2>Twoja klasa</h2>
+              <span class="class-name" id="teacher-class-name"></span>
+            </div>
+            <label class="field-label" for="join-key-display">Klucz klasy (dla uczniów)</label>
+            <div class="key-row">
+              <input id="join-key-display" type="text" readonly />
+              <button class="button button-secondary key-copy" id="copy-key" type="button" aria-label="Kopiuj klucz">Kopiuj</button>
+            </div>
+            <button class="button button-ghost button-block" id="regenerate-key" type="button">Wygeneruj nowy klucz</button>
+          </section>
+
+          <!-- Teacher: students list -->
+          <section class="side-card" id="teacher-students-section" hidden>
+            <div class="side-card-header">
+              <h2>Uczniowie</h2>
+              <span class="count-badge" id="students-count">0</span>
+            </div>
+            <ul class="student-list" id="student-list"></ul>
+            <p class="pending-title">Nierozliczone plusy/minusy</p>
+            <div class="pending-grades" id="pending-grades"></div>
+          </section>
+
+          <!-- Student: your points -->
+          <section class="side-card" id="student-section" hidden>
+            <div class="side-card-header">
+              <h2>Twoje punkty</h2>
+            </div>
+            <div class="grade-points" id="student-points"></div>
+            <p class="student-note">Nauczyciel oznacza plusy i minusy podczas odpowiedzi.</p>
+          </section>
+        </div>
+      </div>
+    </div>
+
+    <div class="toast" id="toast" role="status" aria-live="polite" aria-atomic="true"></div>
+  </body>
+</html>
