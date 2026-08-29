@@ -90,37 +90,94 @@ function db(): PDO
         return $pdo;
     }
 
-    $host = getenv('ZOLWIE_DB_HOST') ?: 'localhost';
-    $port = getenv('ZOLWIE_DB_PORT') ?: '3306';
-    $socket = getenv('ZOLWIE_DB_SOCKET') ?: '';
-    $database = getenv('ZOLWIE_DB_NAME') ?: 'zolwie';
-    $user = getenv('ZOLWIE_DB_USER') ?: 'root';
-    $password = getenv('ZOLWIE_DB_PASSWORD') ?: '';
     $options = [
         PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
         PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
         PDO::ATTR_EMULATE_PREPARES => false,
     ];
 
-    try {
-        $pdo = new PDO(createMysqlDsn($host, $port, $socket, $database), $user, $password, $options);
-    } catch (PDOException $exception) {
-        $errorInfo = $exception->errorInfo;
-        if (!isset($errorInfo[1]) || (int) $errorInfo[1] !== 1049) {
-            throw $exception;
-        }
-        $pdo = new PDO(createMysqlDsn($host, $port, $socket), $user, $password, $options);
-        $quoted = str_replace('`', '``', $database);
-        $pdo->exec("CREATE DATABASE IF NOT EXISTS `{$quoted}` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci");
-        $pdo->exec("USE `{$quoted}`");
+    // SQLite — plik w folderze projektu, przenośny (XAMPP Apache wystarczy, MySQL niepotrzebny)
+    // Ścieżkę można nadpisać env ZOLWIE_DB_SQLITE
+    $sqliteFile = getenv('ZOLWIE_DB_SQLITE') ?: __DIR__ . '/../database.sqlite';
+    $dir = dirname($sqliteFile);
+    if (!is_dir($dir) && $dir !== '' && $dir !== '.') {
+        mkdir($dir, 0777, true);
     }
 
+    // Fallback na MySQL jeśli ustawiono ZOLWIE_DB_HOST (dla kompatybilności)
+    $useMysql = getenv('ZOLWIE_DB_HOST') !== false && getenv('ZOLWIE_DB_HOST') !== '';
+    if ($useMysql) {
+        $host = getenv('ZOLWIE_DB_HOST') ?: 'localhost';
+        $port = getenv('ZOLWIE_DB_PORT') ?: '3306';
+        $socket = getenv('ZOLWIE_DB_SOCKET') ?: '';
+        $database = getenv('ZOLWIE_DB_NAME') ?: 'zolwie';
+        $user = getenv('ZOLWIE_DB_USER') ?: 'root';
+        $password = getenv('ZOLWIE_DB_PASSWORD') ?: '';
+        try {
+            $pdo = new PDO(createMysqlDsn($host, $port, $socket, $database), $user, $password, $options);
+        } catch (PDOException $exception) {
+            $errorInfo = $exception->errorInfo;
+            if (!isset($errorInfo[1]) || (int) $errorInfo[1] !== 1049) {
+                throw $exception;
+            }
+            $pdo = new PDO(createMysqlDsn($host, $port, $socket), $user, $password, $options);
+            $quoted = str_replace('`', '``', $database);
+            $pdo->exec("CREATE DATABASE IF NOT EXISTS `{$quoted}` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci");
+            $pdo->exec("USE `{$quoted}`");
+        }
+        ensureSchema($pdo);
+        return $pdo;
+    }
+
+    $pdo = new PDO('sqlite:' . $sqliteFile, null, null, $options);
+    $pdo->exec('PRAGMA foreign_keys = ON');
+    $pdo->exec('PRAGMA journal_mode = WAL');
     ensureSchema($pdo);
     return $pdo;
 }
 
 function ensureSchema(PDO $pdo): void
 {
+    $isSqlite = $pdo->getAttribute(PDO::ATTR_DRIVER_NAME) === 'sqlite';
+
+    if ($isSqlite) {
+        $pdo->exec(
+            "CREATE TABLE IF NOT EXISTS klasy (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                teacher_id INTEGER,
+                name TEXT NOT NULL,
+                join_key TEXT NOT NULL UNIQUE,
+                created_at DATETIME
+            )"
+        );
+        $pdo->exec(
+            "CREATE TABLE IF NOT EXISTS uzytkownicy (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                full_name TEXT NOT NULL,
+                login TEXT NOT NULL UNIQUE,
+                haslo TEXT NOT NULL,
+                rola TEXT NOT NULL,
+                class_id INTEGER,
+                data_utworzenia DATETIME,
+                FOREIGN KEY (class_id) REFERENCES klasy(id) ON DELETE SET NULL
+            )"
+        );
+        $pdo->exec(
+            "CREATE TABLE IF NOT EXISTS oceny (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                class_id INTEGER NOT NULL,
+                student_id INTEGER NOT NULL,
+                teacher_id INTEGER NOT NULL,
+                rodzaj TEXT NOT NULL CHECK (rodzaj IN ('plus','minus','absent')),
+                data_utworzenia DATETIME,
+                FOREIGN KEY (class_id) REFERENCES klasy(id) ON DELETE CASCADE,
+                FOREIGN KEY (student_id) REFERENCES uzytkownicy(id) ON DELETE CASCADE,
+                FOREIGN KEY (teacher_id) REFERENCES uzytkownicy(id) ON DELETE CASCADE
+            )"
+        );
+        return;
+    }
+
     $pdo->exec(
         "CREATE TABLE IF NOT EXISTS klasy (
             id INT AUTO_INCREMENT PRIMARY KEY,
@@ -296,13 +353,13 @@ function register(): void
                 $pdo->rollBack();
                 respond(422, ['message' => 'Podaj nazwę klasy.']);
             }
-            $insertClass = $pdo->prepare('INSERT INTO klasy (teacher_id, name, join_key, created_at) VALUES (NULL, :name, :key, NOW())');
+            $insertClass = $pdo->prepare('INSERT INTO klasy (teacher_id, name, join_key, created_at) VALUES (NULL, :name, :key, CURRENT_TIMESTAMP)');
             $insertClass->execute(['name' => $name, 'key' => generateJoinKey()]);
             $classId = (int) $pdo->lastInsertId();
             $className = $name;
         }
 
-        $insertUser = $pdo->prepare('INSERT INTO uzytkownicy (full_name, login, haslo, rola, class_id, data_utworzenia) VALUES (:name, :login, :haslo, :rola, :class, NOW())');
+        $insertUser = $pdo->prepare('INSERT INTO uzytkownicy (full_name, login, haslo, rola, class_id, data_utworzenia) VALUES (:name, :login, :haslo, :rola, :class, CURRENT_TIMESTAMP)');
         $insertUser->execute([
             'name' => $fullName,
             'login' => $login,
@@ -497,7 +554,7 @@ function addGrade(): void
     if ($studentStmt->fetch() === false) {
         respond(422, ['message' => 'Uczeń nie należy do twojej klasy.']);
     }
-    $insert = db()->prepare('INSERT INTO oceny (class_id, student_id, teacher_id, rodzaj, data_utworzenia) VALUES (:class, :student, :teacher, :type, NOW())');
+    $insert = db()->prepare('INSERT INTO oceny (class_id, student_id, teacher_id, rodzaj, data_utworzenia) VALUES (:class, :student, :teacher, :type, CURRENT_TIMESTAMP)');
     $insert->execute(['class' => $class['id'], 'student' => $studentId, 'teacher' => (int) $user['id'], 'type' => $type]);
     respond(201, ['message' => 'Wpis został dodany.']);
 }
@@ -546,7 +603,7 @@ function pendingGrades(): void
             'SELECT u.id, u.full_name, o.id AS ocena_id, o.rodzaj, o.data_utworzenia
              FROM uzytkownicy u
              JOIN oceny o ON o.student_id = u.id
-             WHERE u.rola = \'student\' AND u.class_id = :class AND o.rodzaj IN (\'plus\',\'minus\')
+             WHERE u.rola = \'student\' AND u.class_id = :class AND o.rodzaj IN (\'plus\',\'minus\',\'absent\')
              ORDER BY u.full_name ASC, u.id ASC, o.data_utworzenia DESC, o.id DESC'
         );
         $statement->execute(['class' => $class['id']]);

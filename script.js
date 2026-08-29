@@ -104,6 +104,17 @@ function renderStudentList() {
     const plus = createStat(student.plusCount, "plus");
     const minus = createStat(student.minusCount, "minus");
     stats.append(plus, minus);
+    const gradeActions = document.createElement("div");
+    gradeActions.className = "student-grade-actions";
+    for (const t of ["plus", "minus", "absent"]) {
+      const b = document.createElement("button");
+      b.className = `grade-mini is-${t}`;
+      b.type = "button";
+      b.textContent = t === "plus" ? "+" : t === "minus" ? "−" : "nb";
+      b.title = t === "plus" ? "Dodaj plus" : t === "minus" ? "Dodaj minus" : "Oznacz nieobecność";
+      b.addEventListener("click", () => addGradeForStudent(student, t, b));
+      gradeActions.append(b);
+    }
     const remove = document.createElement("button");
     remove.className = "student-remove";
     remove.type = "button";
@@ -112,7 +123,7 @@ function renderStudentList() {
     remove.title = "Usuń ucznia";
     remove.setAttribute("aria-label", `Usuń ucznia ${student.fullName}`);
     remove.addEventListener("click", () => removeStudent(student));
-    li.append(name, stats, remove);
+    li.append(name, stats, gradeActions, remove);
     return li;
   }));
 }
@@ -166,6 +177,8 @@ function resetPebbleView() {
   pebbleRaceState = [];
   activeStudent = null;
   if (pebbleWinner) { pebbleWinner.hidden = true; pebbleWinner.textContent = ""; }
+  const wa = $("#winner-actions");
+  if (wa) wa.hidden = true;
   if (pebbleTurtles) pebbleTurtles.replaceChildren();
   if (lessonRandom) lessonRandom.disabled = !hasStudentsForPebble();
 }
@@ -251,7 +264,7 @@ function startPebbleRace() {
     student,
     color: raceColors[index % raceColors.length],
     position: 0,
-    speed: 10 + Math.random() * 6,
+    speed: 6 + Math.random() * 7,
     finished: false,
     finishedOrder: null,
   }));
@@ -266,11 +279,17 @@ function animatePebble(now) {
   if (!pebbleRacing) return;
   const dt = Math.min(0.05, (now - pebbleLastTime) / 1000);
   pebbleLastTime = now;
+  const active = pebbleRaceState.filter((r) => !r.finished);
+  const avgPos = active.length ? active.reduce((s, r) => s + r.position, 0) / active.length : 0;
   let allFinished = true;
   pebbleRaceState.forEach((racer) => {
     if (racer.finished) return;
-    const jitter = 0.85 + Math.random() * 0.3;
-    racer.position += racer.speed * dt * jitter;
+    racer.speed += (Math.random() - 0.5) * 1.0;
+    if (racer.position < avgPos - 7) racer.speed += 0.25;
+    else if (racer.position > avgPos + 7) racer.speed -= 0.2;
+    racer.speed = Math.max(5, Math.min(15, racer.speed));
+    const jitter = 0.75 + Math.random() * 0.5;
+    racer.position += racer.speed * dt * jitter * 0.85;
     if (racer.position >= 100) {
       racer.position = 100;
       racer.finished = true;
@@ -307,6 +326,8 @@ function finishPebbleRace() {
       pebbleWinner.textContent = `${activeStudent.fullName} — odpowiada!`;
       pebbleWinner.hidden = false;
     }
+    const wa = $("#winner-actions");
+    if (wa) wa.hidden = false;
     showToast(`${activeStudent.fullName} jest ostatni na kamyczkach i odpowiada.`);
   }
   if (lessonRandom) lessonRandom.disabled = false;
@@ -352,7 +373,7 @@ async function renderPendingGrades() {
     dots.append(...student.points.map((point) => {
       const span = document.createElement("span");
       span.className = `pending-dot is-${point.type}`;
-      span.textContent = point.type === "plus" ? "+" : "−";
+      span.textContent = point.type === "plus" ? "+" : point.type === "minus" ? "−" : "nb";
       span.title = point.createdAt;
       return span;
     }));
@@ -384,16 +405,32 @@ async function renderStudentPoints() {
 
 async function markStudent(type) {
   if (!account || account.role !== "teacher" || !activeStudent) return;
-  if (document.querySelector(`[data-lesson-mark="${type}"]`)?.disabled) return;
-  document.querySelectorAll("[data-lesson-mark]").forEach((button) => { button.disabled = true; });
+  const btns = document.querySelectorAll("[data-winner-mark]");
+  btns.forEach((b) => { b.disabled = true; });
   try {
     await callApi("add-grade", { method: "POST", body: JSON.stringify({ studentId: activeStudent.id, type }) });
     showToast(type === "plus" ? "Dodano plus." : type === "minus" ? "Dodano minus." : "Oznaczono jako nieobecny(a).");
     activeStudent = null;
+    const wa = $("#winner-actions");
+    if (wa) wa.hidden = true;
+    if (pebbleWinner) { pebbleWinner.hidden = true; pebbleWinner.textContent = ""; }
     await loadStudents();
   } catch (error) {
     showToast(error.message);
-    document.querySelectorAll("[data-lesson-mark]").forEach((button) => { button.disabled = false; });
+    btns.forEach((b) => { b.disabled = false; });
+  }
+}
+
+async function addGradeForStudent(student, type, button) {
+  if (!account || account.role !== "teacher") return;
+  if (button) button.disabled = true;
+  try {
+    await callApi("add-grade", { method: "POST", body: JSON.stringify({ studentId: student.id, type }) });
+    showToast(type === "plus" ? `Dodano plus dla ${student.fullName}.` : type === "minus" ? `Dodano minus dla ${student.fullName}.` : `Oznaczono ${student.fullName} jako nieobecny(a).`);
+    await loadStudents();
+  } catch (error) {
+    showToast(error.message);
+    if (button) button.disabled = false;
   }
 }
 
@@ -523,6 +560,7 @@ document.addEventListener("keydown", (event) => {
 });
 
 lessonRandom?.addEventListener("click", startPebbleRace);
+document.querySelectorAll("[data-winner-mark]").forEach((btn) => btn.addEventListener("click", () => markStudent(btn.dataset.winnerMark)));
 
 document.querySelectorAll("[data-auth-tab]").forEach((tab) => {
   tab.addEventListener("click", () => {
