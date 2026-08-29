@@ -5,8 +5,8 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="description" content="Pędzące żółwie — losowanie do odpowiedzi i ocenianie w klasie." />
     <title>Pędzące żółwie — losowanie do odpowiedzi</title>
-    <link rel="stylesheet" href="styles.css?v=32" />
-    <script src="script.js?v=32" defer></script>
+    <link rel="stylesheet" href="styles.css?v=59" />
+    <script src="script.js?v=59" defer></script>
   </head>
   <body>
     <div class="app">
@@ -60,15 +60,15 @@
             <form class="auth-form" id="register-form" hidden>
               <label for="reg-role">Typ konta</label>
               <select id="reg-role" name="role">
+                <option value="student" selected>Uczeń</option>
                 <option value="teacher">Nauczyciel</option>
-                <option value="student">Uczeń</option>
               </select>
-              <div class="reg-teacher-only">
+              <div class="reg-teacher-only" hidden>
                 <label for="reg-class-name">Nazwa klasy</label>
                 <input id="reg-class-name" name="className" type="text" placeholder="np. 3A" />
               </div>
-              <div class="reg-student-only" hidden>
-                <label for="reg-join-key">Klucz klasy (od nauczyciela)</label>
+              <div class="reg-student-only">
+                <label for="reg-join-key">Kod jednorazowy od nauczyciela</label>
                 <input id="reg-join-key" name="joinKey" type="text" placeholder="np. 1A2B3C4D" />
               </div>
               <label for="reg-name">Imię i nazwisko</label>
@@ -79,7 +79,7 @@
               <input id="reg-password" name="password" type="password" autocomplete="new-password" />
               <label for="reg-confirm">Powtórz hasło</label>
               <input id="reg-confirm" name="confirmPassword" type="password" autocomplete="new-password" />
-              <p class="form-hint">Minimum 8 znaków, mała i wielka litera oraz cyfra.</p>
+              <p class="form-hint">Hasło może być dowolne.</p>
               <p class="form-error" id="register-error" role="alert" hidden></p>
               <button class="button button-primary" type="submit">Załóż konto</button>
             </form>
@@ -94,18 +94,26 @@
             <button class="button button-ghost button-block" id="logout-button" type="button">Wyloguj</button>
           </section>
 
-          <!-- Teacher: class -->
-          <section class="side-card" id="teacher-class-section" hidden>
-            <div class="side-card-header">
-              <h2>Twoja klasa</h2>
-              <span class="class-name" id="teacher-class-name"></span>
+          <!-- Teacher: one-time invites -->
+          <section class="side-card" id="teacher-invite-section" hidden>
+            <div class="side-card-header" style="flex-wrap:wrap;">
+              <h2>Jednorazowe kody</h2>
+              <div class="class-switcher">
+                <span class="class-name" id="teacher-class-name"></span>
+                <div class="custom-select" id="class-switcher-wrap" hidden>
+                  <button class="custom-select-trigger" id="class-switcher-trigger" type="button" aria-haspopup="listbox" aria-expanded="false">
+                    <span id="class-switcher-label">Wybierz klasę</span>
+                    <span class="custom-select-arrow" aria-hidden="true"></span>
+                  </button>
+                  <ul class="custom-select-options" id="class-switcher-options" role="listbox" hidden></ul>
+                </div>
+                <select id="class-switcher" class="class-switcher-select" hidden></select>
+                <button class="button button-primary button-small" id="new-class-btn" type="button">+ Nowa klasa</button>
+              </div>
             </div>
-            <label class="field-label" for="join-key-display">Klucz klasy (dla uczniów)</label>
-            <div class="key-row">
-              <input id="join-key-display" type="text" readonly />
-              <button class="button button-secondary key-copy" id="copy-key" type="button" aria-label="Kopiuj klucz">Kopiuj</button>
-            </div>
-            <button class="button button-ghost button-block" id="regenerate-key" type="button">Wygeneruj nowy klucz</button>
+            <p class="student-note">Wygeneruj jednorazowy kod dla jednego ucznia — kod działa tylko raz, chroni przed botami.</p>
+            <button class="button button-primary button-block" id="generate-invite" type="button">Wygeneruj kod jednorazowy</button>
+            <div class="invite-list" id="invite-list"></div>
           </section>
 
           <!-- Teacher: students list -->
@@ -127,6 +135,20 @@
             <div class="grade-points" id="student-points"></div>
             <p class="student-note">Nauczyciel oznacza plusy i minusy podczas odpowiedzi.</p>
           </section>
+        </div>
+      </div>
+    </div>
+
+    <div class="new-class-overlay" id="new-class-overlay" hidden>
+      <div class="new-class-backdrop" data-new-class-backdrop></div>
+      <div class="new-class-panel" role="dialog" aria-modal="true" aria-label="Nowa klasa">
+        <h3>Nowa klasa</h3>
+        <label for="new-class-name">Nazwa klasy</label>
+        <input id="new-class-name" type="text" placeholder="np. 3B" />
+        <p class="form-error" id="new-class-error" role="alert" hidden></p>
+        <div class="new-class-actions">
+          <button class="button button-secondary" id="new-class-cancel" type="button">Anuluj</button>
+          <button class="button button-primary" id="new-class-submit" type="button">Utwórz</button>
         </div>
       </div>
     </div>

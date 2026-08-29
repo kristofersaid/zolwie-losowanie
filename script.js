@@ -4,7 +4,7 @@ const $ = (selector) => document.querySelector(selector);
 
 const authSection = $("#auth-section");
 const accountSection = $("#account-section");
-const teacherClassSection = $("#teacher-class-section");
+const teacherInviteSection = $("#teacher-invite-section");
 const teacherStudentsSection = $("#teacher-students-section");
 const studentSection = $("#student-section");
 const loginForm = $("#login-form");
@@ -74,7 +74,7 @@ function applyContent() {
   const loggedIn = Boolean(account);
   authSection.hidden = loggedIn;
   accountSection.hidden = !loggedIn;
-  teacherClassSection.hidden = !(loggedIn && account.role === "teacher");
+  teacherInviteSection.hidden = !(loggedIn && account.role === "teacher");
   teacherStudentsSection.hidden = !(loggedIn && account.role === "teacher");
   studentSection.hidden = !(loggedIn && account.role === "student");
 
@@ -155,9 +155,12 @@ function initPebbleAvailability() {
   if (lessonRandom) lessonRandom.disabled = !has || pebbleRacing;
   if (!has) {
     if (pebbleWinner) { pebbleWinner.hidden = true; pebbleWinner.textContent = ""; }
+    const wa = $("#winner-actions");
+    if (wa) wa.hidden = true;
     if (pebbleTurtles) pebbleTurtles.replaceChildren();
-  } else if (!pebbleRacing && pebbleRaceState.length === 0) {
-    // pokaż żółwie na starcie przed wyścigiem
+    pebbleRaceState = [];
+  } else if (!pebbleRacing) {
+    // pokaż żółwie z aktualnej klasy od razu (bez klikania Start)
     pebbleRaceState = students.map((student, index) => ({
       student,
       color: raceColors[index % raceColors.length],
@@ -168,6 +171,8 @@ function initPebbleAvailability() {
     }));
     renderPebbleTurtles();
     if (pebbleWinner) pebbleWinner.hidden = true;
+    const wa = $("#winner-actions");
+    if (wa) wa.hidden = true;
   }
 }
 
@@ -212,12 +217,11 @@ function renderPebbleTurtles() {
     const wrap = document.createElement("div");
     wrap.className = `turtle-pebble${racer.finished ? " is-finished" : ""}`;
     wrap.style.setProperty("--turtle-color", racer.color);
-    const turtleW = 38;
-    const startLeft = 100;
-    const endLeft = Math.max(startLeft, trackW - 150 - turtleW);
-    const x = startLeft + Math.max(0, Math.min(100, racer.position)) / 100 * (endLeft - startLeft);
-    wrap.style.left = `${x}px`;
-    wrap.style.transform = "none";
+    const startPct = 5.64;
+    const endPct = 91.54;
+    const xPct = startPct + Math.max(0, Math.min(100, racer.position)) / 100 * (endPct - startPct);
+    wrap.style.left = `${xPct}%`;
+    wrap.style.transform = "translateX(-50%)";
     wrap.style.top = `${baseTop + wave - 13}px`;
     const icon = document.createElement("span");
     icon.className = "turtle-icon";
@@ -377,7 +381,29 @@ async function renderPendingGrades() {
       span.title = point.createdAt;
       return span;
     }));
-    row.append(name, dots);
+    const right = document.createElement("div");
+    right.style.display = "flex";
+    right.style.alignItems = "center";
+    right.style.gap = "8px";
+    right.style.marginLeft = "auto";
+    const settle = document.createElement("button");
+    settle.className = "student-remove";
+    settle.type = "button";
+    settle.textContent = "rozliczone";
+    settle.title = "Rozlicz ucznia";
+    settle.style.color = "var(--green)";
+    settle.style.borderColor = "color-mix(in srgb, var(--green) 40%, var(--line))";
+    settle.style.background = "color-mix(in srgb, var(--green) 8%, var(--surface))";
+    settle.addEventListener("click", async () => {
+      settle.disabled = true;
+      try {
+        await callApi("settle-grades", { method: "POST", body: JSON.stringify({ studentId: student.id }) });
+        showToast(`Rozliczono ${student.fullName}.`);
+        await loadStudents();
+      } catch (e) { showToast(e.message); settle.disabled = false; }
+    });
+    right.append(dots, settle);
+    row.append(name, right);
     return row;
   }));
 }
@@ -491,6 +517,7 @@ function applySession(data) {
   account = data.account;
   csrfToken = data.csrfToken;
   teacherClass = data.class || null;
+  currentClassId = teacherClass ? teacherClass.id : null;
   clearAuthInputs();
   applyContent();
   syncUI();
@@ -506,17 +533,16 @@ function applySession(data) {
 function syncUI() {
   if (!account) return;
   if (account.role === "teacher") {
-    teacherClassSection.hidden = false;
+    teacherInviteSection.hidden = false;
     teacherStudentsSection.hidden = false;
-    $("#join-key-display").value = teacherClass ? teacherClass.joinKey : "";
     $("#teacher-class-name").textContent = teacherClass ? teacherClass.name : "";
+    loadClasses().then(() => loadInvites().catch(()=>{})).catch(()=>{});
   } else {
     studentSection.hidden = false;
   }
 }
 
 function renderTeacherClass() {
-  $("#join-key-display").value = teacherClass ? teacherClass.joinKey : "";
   $("#teacher-class-name").textContent = teacherClass ? teacherClass.name : "";
 }
 
@@ -576,25 +602,209 @@ loginForm.addEventListener("submit", handleLogin);
 registerForm.addEventListener("submit", handleRegister);
 $("#logout-button").addEventListener("click", handleLogout);
 
-$("#copy-key").addEventListener("click", () => {
-  const input = $("#join-key-display");
-  navigator.clipboard.writeText(input.value).then(
-    () => showToast("Skopiowano klucz klasy."),
-    () => showToast("Nie udało się skopiować klucza.")
-  );
+async function loadInvites() {
+  if (!account || account.role !== "teacher") return;
+  try {
+    const data = await callApi("list-invites", { method: "GET" });
+    const container = $("#invite-list");
+    if (!container) return;
+    if (data.codes.length === 0) {
+      container.replaceChildren();
+      const p = document.createElement("p");
+      p.className = "pending-empty";
+      p.textContent = "Brak kodów jednorazowych.";
+      container.append(p);
+      return;
+    }
+    container.replaceChildren(...data.codes.map((row) => {
+      const div = document.createElement("div");
+      div.className = `invite-row${row.used ? " is-used" : ""}`;
+      const code = document.createElement("code");
+      code.textContent = row.code;
+      const badgeWrap = document.createElement("div");
+      badgeWrap.style.flex = "1 1 auto";
+      badgeWrap.style.display = "flex";
+      badgeWrap.style.justifyContent = "center";
+      const badge = document.createElement("span");
+      badge.className = "badge-used";
+      badge.textContent = row.used ? "użyty" : "aktywny";
+      badge.style.background = row.used ? "var(--surface-muted)" : "var(--purple-soft)";
+      badge.style.color = row.used ? "var(--text-soft)" : "var(--purple)";
+      badgeWrap.append(badge);
+      const actions = document.createElement("div");
+      actions.className = "invite-actions";
+      const copy = document.createElement("button");
+      copy.className = "student-remove";
+      copy.type = "button";
+      copy.textContent = "Kopiuj";
+      copy.title = "Kopiuj kod";
+      copy.style.color = "var(--purple)";
+      copy.style.borderColor = "color-mix(in srgb, var(--purple) 42%, var(--line))";
+      copy.style.background = "color-mix(in srgb, var(--purple) 7%, var(--surface))";
+      copy.addEventListener("click", () => {
+        navigator.clipboard.writeText(row.code).then(
+          () => showToast("Skopiowano " + row.code),
+          () => showToast("Nie udało się skopiować.")
+        );
+      });
+      const del = document.createElement("button");
+      del.className = "student-remove";
+      del.type = "button";
+      del.textContent = "Usuń";
+      del.title = "Usuń kod";
+      del.addEventListener("click", async () => {
+        try {
+          await callApi("delete-invite", { method: "POST", body: JSON.stringify({ code: row.code }) });
+          showToast("Usunięto kod.");
+          await loadInvites();
+        } catch (e) { showToast(e.message); }
+      });
+      actions.append(copy, del);
+      div.append(code, badgeWrap, actions);
+      return div;
+    }));
+  } catch (e) {}
+}
+
+$("#generate-invite")?.addEventListener("click", async () => {
+  try {
+    const data = await callApi("generate-invite", { method: "POST", body: JSON.stringify({}) });
+    await loadInvites();
+    showToast("Wygenerowano kod jednorazowy: " + data.code);
+  } catch (error) { showToast(error.message); }
 });
 
-$("#regenerate-key").addEventListener("click", async () => {
-  if (!window.confirm("Wygenerować nowy klucz klasy? Dotychczasowy przestanie działać.")) return;
+let currentClassId = null;
+
+async function loadClasses() {
+  if (!account || account.role !== "teacher") return;
   try {
-    const data = await callApi("regenerate-key", { method: "POST", body: JSON.stringify({}) });
-    teacherClass = data.class;
-    renderTeacherClass();
-    showToast("Wygenerowano nowy klucz.");
-  } catch (error) {
-    showToast(error.message);
+    const data = await callApi("list-classes", { method: "GET" });
+    const classes = data.classes || [];
+    const sel = $("#class-switcher");
+    const label = $("#teacher-class-name");
+    const wrap = $("#class-switcher-wrap");
+    const trigger = $("#class-switcher-trigger");
+    const trigLabel = $("#class-switcher-label");
+    const opts = $("#class-switcher-options");
+    if (classes.length <= 1) {
+      if (label) { label.hidden = false; label.textContent = teacherClass ? teacherClass.name : ""; }
+      if (sel) sel.hidden = true;
+      if (wrap) wrap.hidden = true;
+      currentClassId = teacherClass ? teacherClass.id : null;
+      return;
+    }
+    if (label) label.hidden = true;
+    if (sel) sel.hidden = true;
+    if (wrap) wrap.hidden = false;
+    // hidden select for form compat
+    if (sel) {
+      sel.replaceChildren(...classes.map((c) => {
+        const o = document.createElement("option");
+        o.value = c.id;
+        o.textContent = c.name;
+        if (teacherClass && c.id === teacherClass.id) o.selected = true;
+        return o;
+      }));
+    }
+    if (!currentClassId && teacherClass) currentClassId = teacherClass.id;
+    else if (currentClassId) {
+      // keep
+    } else currentClassId = classes[0].id;
+    const current = classes.find((c) => c.id === currentClassId) || classes[0];
+    if (trigLabel) trigLabel.textContent = current.name;
+    if (opts) {
+      const rebuild = () => {
+        opts.replaceChildren(...classes.map((c) => {
+          const li = document.createElement("li");
+          li.textContent = c.name;
+          li.dataset.value = c.id;
+          li.setAttribute("role", "option");
+          if (c.id === currentClassId) li.classList.add("is-selected");
+          li.addEventListener("click", async () => {
+            currentClassId = c.id;
+            if (teacherClass) teacherClass.name = c.name;
+            trigLabel.textContent = c.name;
+            opts.querySelectorAll("li").forEach((el) => el.classList.toggle("is-selected", parseInt(el.dataset.value,10)===c.id));
+            opts.hidden = true;
+            trigger.setAttribute("aria-expanded", "false");
+            if (sel) sel.value = c.id;
+            await loadStudents();
+            await loadInvites();
+            initPebbleAvailability();
+          });
+          return li;
+        }));
+      };
+      rebuild();
+    }
+  } catch (e) {}
+}
+
+$("#class-switcher-trigger")?.addEventListener("click", () => {
+  const opts = $("#class-switcher-options");
+  const trg = $("#class-switcher-trigger");
+  if (!opts || !trg) return;
+  const willOpen = opts.hidden;
+  if (willOpen) {
+    opts.querySelectorAll("li").forEach((el) => el.classList.toggle("is-selected", parseInt(el.dataset.value,10)===currentClassId));
+  }
+  opts.hidden = !willOpen;
+  trg.setAttribute("aria-expanded", willOpen ? "true" : "false");
+});
+document.addEventListener("click", (e) => {
+  const wrap = $("#class-switcher-wrap");
+  if (!wrap || wrap.hidden) return;
+  if (!wrap.contains(e.target)) {
+    $("#class-switcher-options").hidden = true;
+    $("#class-switcher-trigger")?.setAttribute("aria-expanded", "false");
   }
 });
+
+function openNewClassPopup() {
+  $("#new-class-overlay").hidden = false;
+  $("#new-class-name").value = "";
+  $("#new-class-error").hidden = true;
+  $("#new-class-name").focus();
+}
+function closeNewClassPopup() {
+  $("#new-class-overlay").hidden = true;
+}
+$("#new-class-btn")?.addEventListener("click", openNewClassPopup);
+$("#new-class-cancel")?.addEventListener("click", closeNewClassPopup);
+$("#new-class-overlay")?.querySelector("[data-new-class-backdrop]")?.addEventListener("click", closeNewClassPopup);
+$("#class-switcher")?.addEventListener("change", async (e) => {
+  currentClassId = parseInt(e.target.value, 10);
+  const sel = e.target.options[e.target.selectedIndex];
+  if (teacherClass) teacherClass.name = sel.textContent;
+  await loadStudents();
+  await loadInvites();
+  initPebbleAvailability();
+});
+$("#new-class-submit")?.addEventListener("click", async () => {
+  const name = $("#new-class-name").value.trim();
+  const err = $("#new-class-error");
+  if (!name) { err.textContent = "Podaj nazwę klasy."; err.hidden = false; return; }
+  try {
+    const data = await callApi("create-class", { method: "POST", body: JSON.stringify({ name }) });
+    closeNewClassPopup();
+    showToast("Utworzono klasę " + data.class.name);
+    location.reload();
+  } catch (e) { err.textContent = e.message; err.hidden = false; }
+});
+
+const _origCallApi = callApi;
+callApi = async function(action, opts={}) {
+  if (account && account.role === "teacher" && currentClassId) {
+    if (["students","list-invites","generate-invite","delete-invite","add-grade","remove-student","pending-grades"].includes(action)) {
+      opts.query = { ...(opts.query||{}), classId: currentClassId };
+      if (["generate-invite","delete-invite","add-grade","remove-student"].includes(action)) {
+        try { const b = JSON.parse(opts.body||"{}"); b.classId = currentClassId; opts.body = JSON.stringify(b); } catch {}
+      }
+    }
+  }
+  return _origCallApi(action, opts);
+};
 
 /* ---------- Init ---------- */
 
@@ -605,6 +815,7 @@ async function init() {
     account = data.account;
     csrfToken = data.csrfToken;
     teacherClass = data.class || null;
+    currentClassId = teacherClass ? teacherClass.id : null;
     applyContent();
     syncUI();
     if (account.role === "teacher") {

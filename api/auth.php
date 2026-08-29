@@ -36,6 +36,12 @@ try {
         'add-grade' => addGrade(),
         'remove-student' => removeStudent(),
         'pending-grades' => pendingGrades(),
+        'generate-invite' => generateInvite(),
+        'list-invites' => listInvites(),
+        'delete-invite' => deleteInvite(),
+        'create-class' => createClass(),
+        'settle-grades' => settleGrades(),
+        'list-classes' => listClasses(),
         default => respond(404, ['message' => 'Nieznana akcja.']),
     };
 } catch (Throwable $exception) {
@@ -175,6 +181,19 @@ function ensureSchema(PDO $pdo): void
                 FOREIGN KEY (teacher_id) REFERENCES uzytkownicy(id) ON DELETE CASCADE
             )"
         );
+        $pdo->exec(
+            "CREATE TABLE IF NOT EXISTS invite_codes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                class_id INTEGER NOT NULL,
+                code TEXT NOT NULL UNIQUE,
+                used INTEGER NOT NULL DEFAULT 0,
+                created_at DATETIME,
+                used_at DATETIME,
+                used_by INTEGER,
+                FOREIGN KEY (class_id) REFERENCES klasy(id) ON DELETE CASCADE,
+                FOREIGN KEY (used_by) REFERENCES uzytkownicy(id) ON DELETE SET NULL
+            )"
+        );
         return;
     }
 
@@ -212,6 +231,20 @@ function ensureSchema(PDO $pdo): void
             CONSTRAINT fk_grade_class FOREIGN KEY (class_id) REFERENCES klasy(id) ON DELETE CASCADE,
             CONSTRAINT fk_grade_student FOREIGN KEY (student_id) REFERENCES uzytkownicy(id) ON DELETE CASCADE,
             CONSTRAINT fk_grade_teacher FOREIGN KEY (teacher_id) REFERENCES uzytkownicy(id) ON DELETE CASCADE
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci"
+    );
+
+    $pdo->exec(
+        "CREATE TABLE IF NOT EXISTS invite_codes (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            class_id INT NOT NULL,
+            code VARCHAR(24) NOT NULL UNIQUE,
+            used TINYINT NOT NULL DEFAULT 0,
+            created_at DATETIME NULL DEFAULT NULL,
+            used_at DATETIME NULL DEFAULT NULL,
+            used_by INT NULL,
+            CONSTRAINT fk_invite_class FOREIGN KEY (class_id) REFERENCES klasy(id) ON DELETE CASCADE,
+            CONSTRAINT fk_invite_user FOREIGN KEY (used_by) REFERENCES uzytkownicy(id) ON DELETE SET NULL
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci"
     );
 }
@@ -283,8 +316,8 @@ function validateNewPassword(string $password, string $confirm): void
     if ($password !== $confirm) {
         respond(422, ['message' => 'Hasła nie są identyczne.']);
     }
-    if (!passwordMeetsPolicy($password)) {
-        respond(422, ['message' => 'Hasło musi mieć co najmniej ' . PASSWORD_MIN_LENGTH . ' znaków oraz zawierać małą i wielką literę oraz cyfrę.']);
+    if ($password === '') {
+        respond(422, ['message' => 'Podaj hasło.']);
     }
 }
 
@@ -325,14 +358,24 @@ function register(): void
     $className = null;
 
     if ($role === 'student' && $joinKey === '') {
-        respond(422, ['message' => 'Podaj klucz klasy otrzymany od nauczyciela.']);
+        respond(422, ['message' => 'Podaj kod jednorazowy otrzymany od nauczyciela.']);
     }
+    $inviteRow = null;
     if ($role === 'student') {
-        $classStmt = db()->prepare('SELECT * FROM klasy WHERE join_key = :key LIMIT 1');
-        $classStmt->execute(['key' => $joinKey]);
+        $inviteStmt = db()->prepare('SELECT * FROM invite_codes WHERE code = :code LIMIT 1');
+        $inviteStmt->execute(['code' => $joinKey]);
+        $inviteRow = $inviteStmt->fetch();
+        if ($inviteRow === false) {
+            respond(422, ['message' => 'Nieprawidłowy kod jednorazowy.']);
+        }
+        if ((int) $inviteRow['used'] === 1) {
+            respond(422, ['message' => 'Kod został już użyty.']);
+        }
+        $classStmt = db()->prepare('SELECT * FROM klasy WHERE id = :id LIMIT 1');
+        $classStmt->execute(['id' => $inviteRow['class_id']]);
         $class = $classStmt->fetch();
         if ($class === false) {
-            respond(422, ['message' => 'Nieprawidłowy klucz klasy.']);
+            respond(422, ['message' => 'Nieprawidłowy kod jednorazowy.']);
         }
         $classId = (int) $class['id'];
         $className = (string) $class['name'];
@@ -372,6 +415,11 @@ function register(): void
         if ($role === 'teacher') {
             $update = $pdo->prepare('UPDATE klasy SET teacher_id = :teacher WHERE id = :id');
             $update->execute(['teacher' => $userId, 'id' => $classId]);
+        }
+
+        if ($role === 'student' && $inviteRow !== null) {
+            $del = $pdo->prepare('DELETE FROM invite_codes WHERE id = :id');
+            $del->execute(['id' => $inviteRow['id']]);
         }
 
         $user = findUserByLogin($login);
@@ -462,6 +510,31 @@ function getTeacherClass(int $teacherId): ?array
     ];
 }
 
+function getTeacherClasses(int $teacherId): array
+{
+    $stmt = db()->prepare('SELECT * FROM klasy WHERE teacher_id = :teacher ORDER BY id ASC');
+    $stmt->execute(['teacher' => $teacherId]);
+    return array_map(static fn(array $row): array => [
+        'id' => (int) $row['id'],
+        'name' => (string) $row['name'],
+        'joinKey' => (string) $row['join_key'],
+    ], $stmt->fetchAll());
+}
+
+function getSelectedClassForTeacher(array $user, ?int $requestedId = null): ?array
+{
+    $teacherId = (int) $user['id'];
+    if ($requestedId !== null) {
+        $stmt = db()->prepare('SELECT * FROM klasy WHERE id = :id AND teacher_id = :teacher LIMIT 1');
+        $stmt->execute(['id' => $requestedId, 'teacher' => $teacherId]);
+        $row = $stmt->fetch();
+        if ($row !== false) {
+            return ['id' => (int) $row['id'], 'name' => (string) $row['name'], 'joinKey' => (string) $row['join_key']];
+        }
+    }
+    return getTeacherClass($teacherId);
+}
+
 function getMyClass(): void
 {
     if ($_SERVER['REQUEST_METHOD'] !== 'GET') {
@@ -473,6 +546,39 @@ function getMyClass(): void
     }
     $class = getTeacherClass((int) $user['id']);
     respond(200, ['class' => $class]);
+}
+
+function listClasses(): void
+{
+    if ($_SERVER['REQUEST_METHOD'] !== 'GET') {
+        respond(405, ['message' => 'Dozwolona jest tylko metoda GET.']);
+    }
+    $user = requireSession();
+    if ($user['rola'] !== 'teacher') {
+        respond(403, ['message' => 'Tylko nauczyciel ma klasy.']);
+    }
+    $classes = getTeacherClasses((int) $user['id']);
+    respond(200, ['classes' => $classes]);
+}
+
+function createClass(): void
+{
+    $data = readJsonBody();
+    requireCsrfToken();
+    $user = requireSession();
+    if ($user['rola'] !== 'teacher') {
+        respond(403, ['message' => 'Tylko nauczyciel może utworzyć klasę.']);
+    }
+    $name = trim((string) ($data['name'] ?? ''));
+    if ($name === '' || textLength($name) > 120) {
+        respond(422, ['message' => 'Podaj poprawną nazwę klasy.']);
+    }
+    $pdo = db();
+    $stmt = $pdo->prepare('INSERT INTO klasy (teacher_id, name, join_key, created_at) VALUES (:teacher, :name, :key, CURRENT_TIMESTAMP)');
+    $stmt->execute(['teacher' => (int) $user['id'], 'name' => $name, 'key' => generateJoinKey()]);
+    $id = (int) $pdo->lastInsertId();
+    $class = ['id' => $id, 'name' => $name, 'joinKey' => getJoinKeyForClass($id)];
+    respond(201, ['class' => $class, 'message' => 'Utworzono klasę.']);
 }
 
 function regenerateClassKey(): void
@@ -488,6 +594,76 @@ function regenerateClassKey(): void
     respond(200, ['class' => getTeacherClass((int) $user['id']), 'message' => 'Wygenerowano nowy klucz klasy.']);
 }
 
+function generateInvite(): void
+{
+    $data = readJsonBody();
+    requireCsrfToken();
+    $user = requireSession();
+    if ($user['rola'] !== 'teacher') {
+        respond(403, ['message' => 'Tylko nauczyciel może wygenerować kod.']);
+    }
+    $requestedId = isset($data['classId']) ? (int) $data['classId'] : null;
+    $class = getSelectedClassForTeacher($user, $requestedId);
+    if ($class === null) {
+        respond(403, ['message' => 'Brak klasy.']);
+    }
+    $code = generateJoinKey();
+    $pdo = db();
+    $stmt = $pdo->prepare('INSERT INTO invite_codes (class_id, code, created_at) VALUES (:class, :code, CURRENT_TIMESTAMP)');
+    $stmt->execute(['class' => $class['id'], 'code' => $code]);
+    respond(201, ['code' => $code, 'message' => 'Wygenerowano jednorazowy kod.']);
+}
+
+function listInvites(): void
+{
+    if ($_SERVER['REQUEST_METHOD'] !== 'GET') {
+        respond(405, ['message' => 'Dozwolona jest tylko metoda GET.']);
+    }
+    $user = requireSession();
+    if ($user['rola'] !== 'teacher') {
+        respond(403, ['message' => 'Tylko nauczyciel może zobaczyć kody.']);
+    }
+    $requestedId = isset($_GET['classId']) ? (int) $_GET['classId'] : null;
+    $class = getSelectedClassForTeacher($user, $requestedId);
+    if ($class === null) {
+        respond(200, ['codes' => []]);
+    }
+    $stmt = db()->prepare('SELECT code, used, created_at, used_at FROM invite_codes WHERE class_id = :class AND used = 0 ORDER BY created_at DESC, id DESC');
+    $stmt->execute(['class' => $class['id']]);
+    $codes = array_map(static fn(array $row): array => [
+        'code' => (string) $row['code'],
+        'used' => (bool) $row['used'],
+        'createdAt' => (string) $row['created_at'],
+        'usedAt' => $row['used_at'] === null ? null : (string) $row['used_at'],
+    ], $stmt->fetchAll());
+    respond(200, ['codes' => $codes]);
+}
+
+function deleteInvite(): void
+{
+    $data = readJsonBody();
+    requireCsrfToken();
+    $user = requireSession();
+    if ($user['rola'] !== 'teacher') {
+        respond(403, ['message' => 'Tylko nauczyciel może usunąć kod.']);
+    }
+    $code = strtoupper(trim((string) ($data['code'] ?? '')));
+    if ($code === '') {
+        respond(422, ['message' => 'Podaj kod do usunięcia.']);
+    }
+    $requestedId = isset($data['classId']) ? (int) $data['classId'] : null;
+    $class = getSelectedClassForTeacher($user, $requestedId);
+    if ($class === null) {
+        respond(403, ['message' => 'Brak klasy.']);
+    }
+    $stmt = db()->prepare('DELETE FROM invite_codes WHERE code = :code AND class_id = :class');
+    $stmt->execute(['code' => $code, 'class' => $class['id']]);
+    if ($stmt->rowCount() === 0) {
+        respond(404, ['message' => 'Kod nie znaleziony.']);
+    }
+    respond(200, ['message' => 'Kod został usunięty.']);
+}
+
 function listStudents(): void
 {
     if ($_SERVER['REQUEST_METHOD'] !== 'GET') {
@@ -497,7 +673,8 @@ function listStudents(): void
     $pdo = db();
 
     if ($user['rola'] === 'teacher') {
-        $class = getTeacherClass((int) $user['id']);
+        $requestedId = isset($_GET['classId']) ? (int) $_GET['classId'] : null;
+        $class = getSelectedClassForTeacher($user, $requestedId);
         if ($class === null) {
             respond(200, ['students' => [], 'absentIds' => []]);
         }
@@ -545,7 +722,8 @@ function addGrade(): void
     if (!in_array($type, ['plus', 'minus', 'absent'], true) || $studentId <= 0) {
         respond(422, ['message' => 'Nieprawidłowy rodzaj wpisu lub uczeń.']);
     }
-    $class = getTeacherClass((int) $user['id']);
+    $requestedId = isset($data['classId']) ? (int) $data['classId'] : null;
+    $class = getSelectedClassForTeacher($user, $requestedId);
     if ($class === null) {
         respond(403, ['message' => 'Brak klasy.']);
     }
@@ -571,7 +749,8 @@ function removeStudent(): void
     if ($studentId <= 0) {
         respond(422, ['message' => 'Nieprawidłowy uczeń.']);
     }
-    $class = getTeacherClass((int) $user['id']);
+    $requestedId = isset($data['classId']) ? (int) $data['classId'] : null;
+    $class = getSelectedClassForTeacher($user, $requestedId);
     if ($class === null) {
         respond(403, ['message' => 'Brak klasy.']);
     }
@@ -594,7 +773,8 @@ function pendingGrades(): void
     $pdo = db();
 
     if ($user['rola'] === 'teacher') {
-        $class = getTeacherClass((int) $user['id']);
+        $requestedId = isset($_GET['classId']) ? (int) $_GET['classId'] : null;
+        $class = getSelectedClassForTeacher($user, $requestedId);
         if ($class === null) {
             respond(200, ['students' => []]);
         }
@@ -632,4 +812,31 @@ function pendingGrades(): void
         'type' => (string) $row['rodzaj'],
         'createdAt' => (string) $row['data_utworzenia'],
     ], $statement->fetchAll())]);
+}
+
+function settleGrades(): void
+{
+    $data = readJsonBody();
+    requireCsrfToken();
+    $user = requireSession();
+    if ($user['rola'] !== 'teacher') {
+        respond(403, ['message' => 'Tylko nauczyciel może rozliczyć.']);
+    }
+    $studentId = (int) ($data['studentId'] ?? 0);
+    if ($studentId <= 0) {
+        respond(422, ['message' => 'Nieprawidłowy uczeń.']);
+    }
+    $requestedId = isset($data['classId']) ? (int) $data['classId'] : null;
+    $class = getSelectedClassForTeacher($user, $requestedId);
+    if ($class === null) {
+        respond(403, ['message' => 'Brak klasy.']);
+    }
+    $check = db()->prepare('SELECT id FROM uzytkownicy WHERE id = :id AND rola = \'student\' AND class_id = :class LIMIT 1');
+    $check->execute(['id' => $studentId, 'class' => $class['id']]);
+    if ($check->fetch() === false) {
+        respond(422, ['message' => 'Uczeń nie należy do twojej klasy.']);
+    }
+    $del = db()->prepare('DELETE FROM oceny WHERE student_id = :student AND class_id = :class');
+    $del->execute(['student' => $studentId, 'class' => $class['id']]);
+    respond(200, ['message' => 'Rozliczono.']);
 }
