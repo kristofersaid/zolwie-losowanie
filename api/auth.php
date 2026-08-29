@@ -386,9 +386,11 @@ function register(): void
     }
 
     $pdo = db();
-    $pdo->beginTransaction();
-    try {
-        $passwordHash = password_hash($password, PASSWORD_DEFAULT);
+$pdo->beginTransaction();
+try {
+    $passwordHash = password_hash($password, PASSWORD_DEFAULT);
+    $updateInvite = db()->prepare('UPDATE invite_codes SET used = 1 WHERE code = :code');
+    $updateInvite->execute(['code' => $joinKey]);
 
         if ($role === 'teacher') {
             $name = trim((string) ($data['className'] ?? ''));

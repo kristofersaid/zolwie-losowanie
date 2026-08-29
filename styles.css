@@ -224,7 +224,6 @@ input, select { font: inherit; }
   background: color-mix(in srgb, var(--red) 7%, var(--surface));
   transition: background .15s ease, color .15s ease, border-color .15s ease, transform .15s ease;
 }
-.student-remove::before { content: "✕"; font-size: 13px; line-height: 1; }
 .student-remove:hover:not(:disabled) { background: var(--red); color: #fff; border-color: var(--red); transform: translateY(-1px); }
 .student-remove:disabled { cursor: not-allowed; opacity: .5; }
 .student-grade-actions { display: flex; gap: 4px; margin-left: 4px; }

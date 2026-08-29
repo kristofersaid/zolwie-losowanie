@@ -176,6 +176,12 @@ function initPebbleAvailability() {
   }
 }
 
+$("#class-refresh-btn")?.addEventListener("click", async () => {
+  await loadStudents();
+  await loadInvites().catch(() => {});
+  showToast("Listy odświeżone.");
+});
+
 function resetPebbleView() {
   stopPebbleRace();
   pebbleFinishOrder = 0;
@@ -217,7 +223,7 @@ function renderPebbleTurtles() {
     const wrap = document.createElement("div");
     wrap.className = `turtle-pebble${racer.finished ? " is-finished" : ""}`;
     wrap.style.setProperty("--turtle-color", racer.color);
-    const startPct = 5.64;
+    const startPct = 6.5;
     const endPct = 91.54;
     const xPct = startPct + Math.max(0, Math.min(100, racer.position)) / 100 * (endPct - startPct);
     wrap.style.left = `${xPct}%`;
@@ -262,6 +268,8 @@ function startLightSequence() {
 
 function startPebbleRace() {
   if (!hasStudentsForPebble() || pebbleRacing) return;
+  const pendingContainer = $("#pending-grades");
+  if (pendingContainer) pendingContainer.replaceChildren();
   pebbleFinishOrder = 0;
   resetLights();
   pebbleRaceState = students.map((student, index) => ({
@@ -507,7 +515,8 @@ async function handleRegister(event) {
     else body.joinKey = $("#reg-join-key").value;
     const data = await callApi("register", { method: "POST", body: JSON.stringify(body) });
     applySession(data);
-    showToast("Konto utworzone.");
+    if (account && account.role === "teacher") showToast("Konto utworzone. Lista uczniów zaktualizowana automatycznie.");
+    else showToast("Konto utworzone.");
   } catch (error) {
     setError($("#register-error"), error.message);
   }
@@ -636,7 +645,7 @@ async function loadInvites() {
       const copy = document.createElement("button");
       copy.className = "student-remove";
       copy.type = "button";
-      copy.textContent = "Kopiuj";
+      copy.innerHTML = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg> Kopiuj';
       copy.title = "Kopiuj kod";
       copy.style.color = "var(--purple)";
       copy.style.borderColor = "color-mix(in srgb, var(--purple) 42%, var(--line))";
