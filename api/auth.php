@@ -37,11 +37,21 @@ try {
         'remove-student' => removeStudent(),
         'pending-grades' => pendingGrades(),
         'generate-invite' => generateInvite(),
+        'generate-qr-invite' => generateQrInvite(),
+        'delete-qr-invite' => deleteQrInvite(),
         'list-invites' => listInvites(),
         'delete-invite' => deleteInvite(),
         'create-class' => createClass(),
         'settle-grades' => settleGrades(),
         'list-classes' => listClasses(),
+        'update-display-name' => updateDisplayName(),
+        'request-name-change' => requestNameChange(),
+        'list-name-requests' => listNameRequests(),
+        'decide-name-request' => decideNameRequest(),
+        'list-characters' => listCharacters(),
+        'set-character' => setCharacter(),
+        'my-name-request' => myNameRequest(),
+        'delete-class' => deleteClass(),
         default => respond(404, ['message' => 'Nieznana akcja.']),
     };
 } catch (Throwable $exception) {
@@ -194,6 +204,44 @@ function ensureSchema(PDO $pdo): void
                 FOREIGN KEY (used_by) REFERENCES uzytkownicy(id) ON DELETE SET NULL
             )"
         );
+        // Migration: multi-use QR codes
+        try {
+            $cols = $pdo->query("PRAGMA table_info(invite_codes)")->fetchAll();
+            $hasMulti = false;
+            foreach ($cols as $c) { if (($c['name'] ?? '') === 'is_multi') { $hasMulti = true; break; } }
+            if (!$hasMulti) {
+                $pdo->exec("ALTER TABLE invite_codes ADD COLUMN is_multi INTEGER NOT NULL DEFAULT 0");
+            }
+        } catch (Throwable $e) {
+            try { $pdo->exec("ALTER TABLE invite_codes ADD COLUMN is_multi INTEGER NOT NULL DEFAULT 0"); } catch (Throwable $e2) {}
+        }
+        $pdo->exec(
+            "CREATE TABLE IF NOT EXISTS name_change_requests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                student_id INTEGER NOT NULL,
+                class_id INTEGER NOT NULL,
+                old_name TEXT NOT NULL,
+                new_name TEXT NOT NULL,
+                status TEXT NOT NULL CHECK (status IN ('pending','approved','rejected')),
+                created_at DATETIME,
+                decided_at DATETIME,
+                decided_by INTEGER,
+                FOREIGN KEY (student_id) REFERENCES uzytkownicy(id) ON DELETE CASCADE,
+                FOREIGN KEY (class_id) REFERENCES klasy(id) ON DELETE CASCADE,
+                FOREIGN KEY (decided_by) REFERENCES uzytkownicy(id) ON DELETE SET NULL
+            )"
+        );
+        // Migration: character column for race
+        try {
+            $uCols = $pdo->query("PRAGMA table_info(uzytkownicy)")->fetchAll();
+            $hasChar = false;
+            foreach ($uCols as $c) { if (($c['name'] ?? '') === 'character') { $hasChar = true; break; } }
+            if (!$hasChar) {
+                $pdo->exec("ALTER TABLE uzytkownicy ADD COLUMN character TEXT");
+            }
+        } catch (Throwable $e) {
+            try { $pdo->exec("ALTER TABLE uzytkownicy ADD COLUMN character TEXT"); } catch (Throwable $e2) {}
+        }
         return;
     }
 
@@ -247,6 +295,38 @@ function ensureSchema(PDO $pdo): void
             CONSTRAINT fk_invite_user FOREIGN KEY (used_by) REFERENCES uzytkownicy(id) ON DELETE SET NULL
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci"
     );
+    try {
+        $check = $pdo->query("SHOW COLUMNS FROM invite_codes LIKE 'is_multi'");
+        if ($check && $check->rowCount() === 0) {
+            $pdo->exec("ALTER TABLE invite_codes ADD COLUMN is_multi TINYINT NOT NULL DEFAULT 0");
+        }
+    } catch (Throwable $e) {
+        try { $pdo->exec("ALTER TABLE invite_codes ADD COLUMN is_multi TINYINT NOT NULL DEFAULT 0"); } catch (Throwable $e2) {}
+    }
+    $pdo->exec(
+        "CREATE TABLE IF NOT EXISTS name_change_requests (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            student_id INT NOT NULL,
+            class_id INT NOT NULL,
+            old_name VARCHAR(160) NOT NULL,
+            new_name VARCHAR(160) NOT NULL,
+            status ENUM('pending','approved','rejected') NOT NULL DEFAULT 'pending',
+            created_at DATETIME NULL DEFAULT NULL,
+            decided_at DATETIME NULL DEFAULT NULL,
+            decided_by INT NULL,
+            CONSTRAINT fk_ncr_student FOREIGN KEY (student_id) REFERENCES uzytkownicy(id) ON DELETE CASCADE,
+            CONSTRAINT fk_ncr_class FOREIGN KEY (class_id) REFERENCES klasy(id) ON DELETE CASCADE,
+            CONSTRAINT fk_ncr_decider FOREIGN KEY (decided_by) REFERENCES uzytkownicy(id) ON DELETE SET NULL
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci"
+    );
+    try {
+        $checkChar = $pdo->query("SHOW COLUMNS FROM uzytkownicy LIKE 'character'");
+        if ($checkChar && $checkChar->rowCount() === 0) {
+            $pdo->exec("ALTER TABLE uzytkownicy ADD COLUMN character VARCHAR(40) NULL DEFAULT NULL");
+        }
+    } catch (Throwable $e) {
+        try { $pdo->exec("ALTER TABLE uzytkownicy ADD COLUMN character VARCHAR(40) NULL DEFAULT NULL"); } catch (Throwable $e2) {}
+    }
 }
 
 function textLength(string $value): int
@@ -303,6 +383,7 @@ function publicUser(array $user): array
         'login' => (string) $user['login'],
         'role' => (string) $user['rola'],
         'classId' => $user['class_id'] === null ? null : (int) $user['class_id'],
+        'character' => ($user['character'] ?? null) === null ? null : (string) $user['character'],
     ];
 }
 
@@ -329,6 +410,18 @@ function generateJoinKey(): string
         $exists->execute(['key' => $key]);
     } while ((int) $exists->fetchColumn() > 0);
     return $key;
+}
+
+function generateInviteCode(): string
+{
+    do {
+        $code = mb_strtoupper(bin2hex(random_bytes(4)));
+        $c1 = db()->prepare('SELECT COUNT(*) FROM invite_codes WHERE code = :code');
+        $c1->execute(['code' => $code]);
+        $c2 = db()->prepare('SELECT COUNT(*) FROM klasy WHERE join_key = :key');
+        $c2->execute(['key' => $code]);
+    } while ((int) $c1->fetchColumn() > 0 || (int) $c2->fetchColumn() > 0);
+    return $code;
 }
 
 function register(): void
@@ -361,6 +454,7 @@ function register(): void
         respond(422, ['message' => 'Podaj kod jednorazowy otrzymany od nauczyciela.']);
     }
     $inviteRow = null;
+    $isMultiInvite = false;
     if ($role === 'student') {
         $inviteStmt = db()->prepare('SELECT * FROM invite_codes WHERE code = :code LIMIT 1');
         $inviteStmt->execute(['code' => $joinKey]);
@@ -368,7 +462,8 @@ function register(): void
         if ($inviteRow === false) {
             respond(422, ['message' => 'Nieprawidłowy kod jednorazowy.']);
         }
-        if ((int) $inviteRow['used'] === 1) {
+        $isMultiInvite = isset($inviteRow['is_multi']) && (int) $inviteRow['is_multi'] === 1;
+        if (!$isMultiInvite && (int) $inviteRow['used'] === 1) {
             respond(422, ['message' => 'Kod został już użyty.']);
         }
         $classStmt = db()->prepare('SELECT * FROM klasy WHERE id = :id LIMIT 1');
@@ -389,8 +484,10 @@ function register(): void
 $pdo->beginTransaction();
 try {
     $passwordHash = password_hash($password, PASSWORD_DEFAULT);
-    $updateInvite = db()->prepare('UPDATE invite_codes SET used = 1 WHERE code = :code');
-    $updateInvite->execute(['code' => $joinKey]);
+    if ($role === 'student' && !$isMultiInvite) {
+        $updateInvite = db()->prepare('UPDATE invite_codes SET used = 1 WHERE code = :code');
+        $updateInvite->execute(['code' => $joinKey]);
+    }
 
         if ($role === 'teacher') {
             $name = trim((string) ($data['className'] ?? ''));
@@ -419,7 +516,7 @@ try {
             $update->execute(['teacher' => $userId, 'id' => $classId]);
         }
 
-        if ($role === 'student' && $inviteRow !== null) {
+        if ($role === 'student' && $inviteRow !== null && !$isMultiInvite) {
             $del = $pdo->prepare('DELETE FROM invite_codes WHERE id = :id');
             $del->execute(['id' => $inviteRow['id']]);
         }
@@ -583,6 +680,52 @@ function createClass(): void
     respond(201, ['class' => $class, 'message' => 'Utworzono klasę.']);
 }
 
+function deleteClass(): void
+{
+    $data = readJsonBody();
+    requireCsrfToken();
+    $user = requireSession();
+    if ($user['rola'] !== 'teacher') {
+        respond(403, ['message' => 'Tylko nauczyciel może usunąć klasę.']);
+    }
+    $classId = (int)($data['classId'] ?? $data['id'] ?? 0);
+    if ($classId <= 0 && isset($data['classId'])) {
+        $classId = (int)$data['classId'];
+    }
+    // fallback: jeśli nie podano id, użyj pierwszej klasy nauczyciela
+    if ($classId <= 0) {
+        $cls = getTeacherClass((int)$user['id']);
+        if ($cls !== null) $classId = (int)$cls['id'];
+    }
+    if ($classId <= 0) {
+        respond(422, ['message' => 'Nie podano klasy do usunięcia.']);
+    }
+    $check = db()->prepare('SELECT * FROM klasy WHERE id = :id AND teacher_id = :tid LIMIT 1');
+    $check->execute(['id' => $classId, 'tid' => (int)$user['id']]);
+    $cls = $check->fetch();
+    if ($cls === false) {
+        respond(404, ['message' => 'Klasa nie znaleziona lub brak uprawnień.']);
+    }
+    $pdo = db();
+    $pdo->beginTransaction();
+    try {
+        // usuń uczniów w klasie
+        $delStudents = $pdo->prepare("DELETE FROM uzytkownicy WHERE class_id = :cid AND rola = 'student'");
+        $delStudents->execute(['cid' => $classId]);
+        // usuń oceny, kody, prośby (kaskada i tak usunie, ale jawnie dla pewności)
+        try { $pdo->prepare("DELETE FROM oceny WHERE class_id = :cid")->execute(['cid' => $classId]); } catch (Throwable $e) {}
+        try { $pdo->prepare("DELETE FROM invite_codes WHERE class_id = :cid")->execute(['cid' => $classId]); } catch (Throwable $e) {}
+        try { $pdo->prepare("DELETE FROM name_change_requests WHERE class_id = :cid")->execute(['cid' => $classId]); } catch (Throwable $e) {}
+        $delClass = $pdo->prepare('DELETE FROM klasy WHERE id = :id AND teacher_id = :tid');
+        $delClass->execute(['id' => $classId, 'tid' => (int)$user['id']]);
+        $pdo->commit();
+    } catch (Throwable $e) {
+        $pdo->rollBack();
+        throw $e;
+    }
+    respond(200, ['message' => 'Usunięto klasę ' . $cls['name'] . '.']);
+}
+
 function regenerateClassKey(): void
 {
     $data = readJsonBody();
@@ -609,11 +752,87 @@ function generateInvite(): void
     if ($class === null) {
         respond(403, ['message' => 'Brak klasy.']);
     }
-    $code = generateJoinKey();
+    $code = generateInviteCode();
     $pdo = db();
-    $stmt = $pdo->prepare('INSERT INTO invite_codes (class_id, code, created_at) VALUES (:class, :code, CURRENT_TIMESTAMP)');
-    $stmt->execute(['class' => $class['id'], 'code' => $code]);
+    try {
+        $stmt = $pdo->prepare('INSERT INTO invite_codes (class_id, code, created_at, is_multi) VALUES (:class, :code, CURRENT_TIMESTAMP, 0)');
+        $stmt->execute(['class' => $class['id'], 'code' => $code]);
+    } catch (Throwable $e) {
+        $stmt = $pdo->prepare('INSERT INTO invite_codes (class_id, code, created_at) VALUES (:class, :code, CURRENT_TIMESTAMP)');
+        $stmt->execute(['class' => $class['id'], 'code' => $code]);
+    }
     respond(201, ['code' => $code, 'message' => 'Wygenerowano jednorazowy kod.']);
+}
+
+function generateQrInvite(): void
+{
+    $data = readJsonBody();
+    requireCsrfToken();
+    $user = requireSession();
+    if ($user['rola'] !== 'teacher') {
+        respond(403, ['message' => 'Tylko nauczyciel może wygenerować kod.']);
+    }
+    $requestedId = isset($data['classId']) ? (int) $data['classId'] : null;
+    $class = getSelectedClassForTeacher($user, $requestedId);
+    if ($class === null) {
+        respond(403, ['message' => 'Brak klasy.']);
+    }
+    $pdo = db();
+    // Usuń poprzednie wielorazowe kody QR dla tej klasy (tylko jeden aktywny na raz)
+    try {
+        $delPrev = $pdo->prepare('DELETE FROM invite_codes WHERE class_id = :class AND is_multi = 1');
+        $delPrev->execute(['class' => $class['id']]);
+    } catch (Throwable $e) {}
+    $code = generateInviteCode();
+    try {
+        $stmt = $pdo->prepare('INSERT INTO invite_codes (class_id, code, created_at, is_multi, used) VALUES (:class, :code, CURRENT_TIMESTAMP, 1, 0)');
+        $stmt->execute(['class' => $class['id'], 'code' => $code]);
+    } catch (Throwable $e) {
+        // fallback if is_multi column missing
+        $stmt = $pdo->prepare('INSERT INTO invite_codes (class_id, code, created_at, used) VALUES (:class, :code, CURRENT_TIMESTAMP, 0)');
+        $stmt->execute(['class' => $class['id'], 'code' => $code]);
+    }
+    respond(201, ['code' => $code, 'message' => 'Wygenerowano wielorazowy kod QR.']);
+}
+
+function deleteQrInvite(): void
+{
+    $data = readJsonBody();
+    requireCsrfToken();
+    $user = requireSession();
+    if ($user['rola'] !== 'teacher') {
+        respond(403, ['message' => 'Tylko nauczyciel może usunąć kod.']);
+    }
+    $code = strtoupper(trim((string) ($data['code'] ?? '')));
+    $requestedId = isset($data['classId']) ? (int) $data['classId'] : null;
+    $class = getSelectedClassForTeacher($user, $requestedId);
+    if ($class === null) {
+        respond(403, ['message' => 'Brak klasy.']);
+    }
+    $pdo = db();
+    if ($code !== '') {
+        try {
+            $stmt = $pdo->prepare('DELETE FROM invite_codes WHERE code = :code AND class_id = :class AND is_multi = 1');
+            $stmt->execute(['code' => $code, 'class' => $class['id']]);
+            if ($stmt->rowCount() === 0) {
+                // fallback: delete even if is_multi flag missing
+                $stmt2 = $pdo->prepare('DELETE FROM invite_codes WHERE code = :code AND class_id = :class');
+                $stmt2->execute(['code' => $code, 'class' => $class['id']]);
+            }
+        } catch (Throwable $e) {
+            $stmt = $pdo->prepare('DELETE FROM invite_codes WHERE code = :code AND class_id = :class');
+            $stmt->execute(['code' => $code, 'class' => $class['id']]);
+        }
+    } else {
+        // Usuń wszystkie wielorazowe kody dla klasy (gdy brak konkretnego kodu)
+        try {
+            $stmt = $pdo->prepare('DELETE FROM invite_codes WHERE class_id = :class AND is_multi = 1');
+            $stmt->execute(['class' => $class['id']]);
+        } catch (Throwable $e) {
+            respond(200, ['message' => 'Brak kodu QR do usunięcia.']);
+        }
+    }
+    respond(200, ['message' => 'Kod QR został usunięty.']);
 }
 
 function listInvites(): void
@@ -630,8 +849,13 @@ function listInvites(): void
     if ($class === null) {
         respond(200, ['codes' => []]);
     }
-    $stmt = db()->prepare('SELECT code, used, created_at, used_at FROM invite_codes WHERE class_id = :class AND used = 0 ORDER BY created_at DESC, id DESC');
-    $stmt->execute(['class' => $class['id']]);
+    try {
+        $stmt = db()->prepare('SELECT code, used, created_at, used_at FROM invite_codes WHERE class_id = :class AND used = 0 AND (is_multi = 0 OR is_multi IS NULL) ORDER BY created_at DESC, id DESC');
+        $stmt->execute(['class' => $class['id']]);
+    } catch (Throwable $e) {
+        $stmt = db()->prepare('SELECT code, used, created_at, used_at FROM invite_codes WHERE class_id = :class AND used = 0 ORDER BY created_at DESC, id DESC');
+        $stmt->execute(['class' => $class['id']]);
+    }
     $codes = array_map(static fn(array $row): array => [
         'code' => (string) $row['code'],
         'used' => (bool) $row['used'],
@@ -681,7 +905,7 @@ function listStudents(): void
             respond(200, ['students' => [], 'absentIds' => []]);
         }
         $statement = $pdo->prepare(
-            'SELECT u.id, u.full_name, u.login, u.rola, u.class_id,
+            'SELECT u.id, u.full_name, u.login, u.rola, u.class_id, u.character,
                     (SELECT COUNT(*) FROM oceny o WHERE o.student_id = u.id AND o.rodzaj = \'plus\') AS plus_count,
                     (SELECT COUNT(*) FROM oceny o WHERE o.student_id = u.id AND o.rodzaj = \'minus\') AS minus_count
              FROM uzytkownicy u
@@ -691,7 +915,7 @@ function listStudents(): void
         $statement->execute(['class' => $class['id']]);
     } else {
         $statement = $pdo->prepare(
-            'SELECT u.id, u.full_name, u.login, u.rola, u.class_id, 0 AS plus_count, 0 AS minus_count
+            'SELECT u.id, u.full_name, u.login, u.rola, u.class_id, u.character, 0 AS plus_count, 0 AS minus_count
              FROM uzytkownicy u
              WHERE u.rola = \'student\' AND u.class_id = :class
              ORDER BY u.full_name ASC, u.id ASC'
@@ -706,6 +930,7 @@ function listStudents(): void
         'classId' => $row['class_id'] === null ? null : (int) $row['class_id'],
         'plusCount' => (int) $row['plus_count'],
         'minusCount' => (int) $row['minus_count'],
+        'character' => ($row['character'] ?? null) === null ? null : (string) $row['character'],
     ], $statement->fetchAll());
 
     respond(200, ['students' => $students]);
@@ -841,4 +1066,284 @@ function settleGrades(): void
     $del = db()->prepare('DELETE FROM oceny WHERE student_id = :student AND class_id = :class');
     $del->execute(['student' => $studentId, 'class' => $class['id']]);
     respond(200, ['message' => 'Rozliczono.']);
+}
+
+function updateDisplayName(): void
+{
+    $data = readJsonBody();
+    requireCsrfToken();
+    $user = requireSession();
+    if ($user['rola'] === 'student') {
+        $raw = trim((string) ($data['fullName'] ?? $data['displayName'] ?? $data['name'] ?? ''));
+        $newName = mb_convert_case($raw, MB_CASE_TITLE, 'UTF-8');
+        if ($newName === '' || textLength($newName) > 160) {
+            respond(422, ['message' => 'Podaj poprawną wyświetlaną nazwę (1–160 znaków).']);
+        }
+        if ($newName === $user['full_name']) {
+            respond(200, ['account' => publicUser($user), 'message' => 'Nazwa bez zmian.']);
+        }
+        $check = db()->prepare("SELECT id FROM name_change_requests WHERE student_id = :sid AND status = 'pending' LIMIT 1");
+        $check->execute(['sid' => (int)$user['id']]);
+        if ($check->fetch() !== false) {
+            respond(422, ['message' => 'Masz już oczekującą prośbę. Poczekaj na decyzję nauczyciela.']);
+        }
+        if ($user['class_id'] === null) {
+            respond(403, ['message' => 'Nie jesteś przypisany do klasy.']);
+        }
+        $stmt = db()->prepare("INSERT INTO name_change_requests (student_id, class_id, old_name, new_name, status, created_at) VALUES (:sid, :cid, :old, :new, 'pending', CURRENT_TIMESTAMP)");
+        $stmt->execute(['sid' => (int)$user['id'], 'cid' => (int)$user['class_id'], 'old' => $user['full_name'], 'new' => $newName]);
+        respond(201, ['message' => 'Wysłano prośbę do nauczyciela o zatwierdzenie.', 'pending' => ['oldName' => $user['full_name'], 'newName' => $newName]]);
+    }
+    $raw = trim((string) ($data['fullName'] ?? $data['displayName'] ?? $data['name'] ?? ''));
+    $newName = mb_convert_case($raw, MB_CASE_TITLE, 'UTF-8');
+    if ($newName === '' || textLength($newName) > 160) {
+        respond(422, ['message' => 'Podaj poprawną wyświetlaną nazwę (1–160 znaków).']);
+    }
+    if ($newName === $user['full_name']) {
+        if (empty($_SESSION['csrf_token'])) {
+            $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
+        }
+        respond(200, ['account' => publicUser($user), 'csrfToken' => $_SESSION['csrf_token'], 'message' => 'Nazwa bez zmian.']);
+    }
+    $stmt = db()->prepare('UPDATE uzytkownicy SET full_name = :name WHERE id = :id');
+    $stmt->execute(['name' => $newName, 'id' => (int) $user['id']]);
+    $updated = requireSession();
+    if (empty($_SESSION['csrf_token'])) {
+        $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
+    }
+    respond(200, ['account' => publicUser($updated), 'csrfToken' => $_SESSION['csrf_token'], 'message' => 'Zaktualizowano wyświetlaną nazwę.']);
+}
+
+function requestNameChange(): void
+{
+    $data = readJsonBody();
+    requireCsrfToken();
+    $user = requireSession();
+    if ($user['rola'] !== 'student') {
+        respond(403, ['message' => 'Tylko uczeń może wysłać prośbę o zmianę nazwy.']);
+    }
+    $raw = trim((string) ($data['fullName'] ?? $data['newName'] ?? $data['name'] ?? ''));
+    $newName = mb_convert_case($raw, MB_CASE_TITLE, 'UTF-8');
+    if ($newName === '' || textLength($newName) > 160) {
+        respond(422, ['message' => 'Podaj poprawną wyświetlaną nazwę (1–160 znaków).']);
+    }
+    if ($newName === $user['full_name']) {
+        respond(422, ['message' => 'Nowa nazwa jest taka sama jak obecna.']);
+    }
+    $check = db()->prepare("SELECT id FROM name_change_requests WHERE student_id = :sid AND status = 'pending' LIMIT 1");
+    $check->execute(['sid' => (int)$user['id']]);
+    if ($check->fetch() !== false) {
+        respond(422, ['message' => 'Masz już oczekującą prośbę. Poczekaj na decyzję nauczyciela.']);
+    }
+    if ($user['class_id'] === null) {
+        respond(403, ['message' => 'Nie jesteś przypisany do klasy.']);
+    }
+    $stmt = db()->prepare("INSERT INTO name_change_requests (student_id, class_id, old_name, new_name, status, created_at) VALUES (:sid, :cid, :old, :new, 'pending', CURRENT_TIMESTAMP)");
+    $stmt->execute(['sid' => (int)$user['id'], 'cid' => (int)$user['class_id'], 'old' => $user['full_name'], 'new' => $newName]);
+    respond(201, ['message' => 'Wysłano prośbę do nauczyciela o zatwierdzenie.', 'pending' => ['oldName' => $user['full_name'], 'newName' => $newName]]);
+}
+
+function listNameRequests(): void
+{
+    if ($_SERVER['REQUEST_METHOD'] !== 'GET') {
+        respond(405, ['message' => 'Dozwolona jest tylko metoda GET.']);
+    }
+    $user = requireSession();
+    if ($user['rola'] !== 'teacher') {
+        respond(403, ['message' => 'Tylko nauczyciel może zobaczyć prośby.']);
+    }
+    $requestedId = isset($_GET['classId']) ? (int)$_GET['classId'] : null;
+    $class = getSelectedClassForTeacher($user, $requestedId);
+    if ($class === null) {
+        respond(200, ['requests' => []]);
+    }
+    $stmt = db()->prepare("
+        SELECT r.id, r.student_id, r.old_name, r.new_name, r.status, r.created_at,
+               u.login, u.full_name AS current_name
+        FROM name_change_requests r
+        JOIN uzytkownicy u ON u.id = r.student_id
+        WHERE r.class_id = :cid AND r.status = 'pending'
+        ORDER BY r.created_at ASC, r.id ASC
+    ");
+    $stmt->execute(['cid' => $class['id']]);
+    $rows = array_map(static fn(array $row): array => [
+        'id' => (int)$row['id'],
+        'studentId' => (int)$row['student_id'],
+        'login' => (string)$row['login'],
+        'oldName' => (string)$row['old_name'],
+        'newName' => (string)$row['new_name'],
+        'currentName' => (string)$row['current_name'],
+        'createdAt' => (string)$row['created_at'],
+        'status' => (string)$row['status'],
+    ], $stmt->fetchAll());
+    respond(200, ['requests' => $rows]);
+}
+
+function decideNameRequest(): void
+{
+    $data = readJsonBody();
+    requireCsrfToken();
+    $user = requireSession();
+    if ($user['rola'] !== 'teacher') {
+        respond(403, ['message' => 'Tylko nauczyciel może decydować o prośbach.']);
+    }
+    $requestId = (int)($data['requestId'] ?? $data['id'] ?? 0);
+    $decision = strtolower(trim((string)($data['decision'] ?? $data['action'] ?? '')));
+    if ($requestId <= 0 || !in_array($decision, ['approve','reject','approved','rejected'], true)) {
+        respond(422, ['message' => 'Nieprawidłowe dane decyzji.']);
+    }
+    $norm = $decision === 'approve' || $decision === 'approved' ? 'approved' : 'rejected';
+    $stmt = db()->prepare("SELECT * FROM name_change_requests WHERE id = :id LIMIT 1");
+    $stmt->execute(['id' => $requestId]);
+    $req = $stmt->fetch();
+    if ($req === false) {
+        respond(404, ['message' => 'Prośba nie znaleziona.']);
+    }
+    if ($req['status'] !== 'pending') {
+        respond(422, ['message' => 'Prośba została już rozpatrzona.']);
+    }
+    $classCheck = db()->prepare("SELECT id FROM klasy WHERE id = :cid AND teacher_id = :tid LIMIT 1");
+    $classCheck->execute(['cid' => $req['class_id'], 'tid' => (int)$user['id']]);
+    if ($classCheck->fetch() === false) {
+        respond(403, ['message' => 'Nie masz uprawnień do tej klasy.']);
+    }
+    $pdo = db();
+    $pdo->beginTransaction();
+    try {
+        if ($norm === 'approved') {
+            $updUser = $pdo->prepare("UPDATE uzytkownicy SET full_name = :name WHERE id = :sid");
+            $updUser->execute(['name' => $req['new_name'], 'sid' => $req['student_id']]);
+        }
+        $updReq = $pdo->prepare("UPDATE name_change_requests SET status = :status, decided_at = CURRENT_TIMESTAMP, decided_by = :did WHERE id = :id");
+        $updReq->execute(['status' => $norm, 'did' => (int)$user['id'], 'id' => $requestId]);
+        $pdo->commit();
+    } catch (Throwable $e) {
+        $pdo->rollBack();
+        throw $e;
+    }
+    respond(200, ['message' => $norm === 'approved' ? 'Zatwierdzono zmianę nazwy.' : 'Odrzucono prośbę.', 'status' => $norm]);
+}
+
+function myNameRequest(): void
+{
+    if ($_SERVER['REQUEST_METHOD'] !== 'GET') {
+        respond(405, ['message' => 'Dozwolona jest tylko metoda GET.']);
+    }
+    $user = requireSession();
+    if ($user['rola'] !== 'student') {
+        respond(403, ['message' => 'Tylko uczeń ma prośby o zmianę nazwy.']);
+    }
+    $stmt = db()->prepare("SELECT id, old_name, new_name, status, created_at FROM name_change_requests WHERE student_id = :sid AND status = 'pending' ORDER BY created_at DESC, id DESC LIMIT 1");
+    $stmt->execute(['sid' => (int)$user['id']]);
+    $row = $stmt->fetch();
+    if ($row === false) {
+        respond(200, ['pending' => null]);
+    }
+    respond(200, ['pending' => [
+        'id' => (int)$row['id'],
+        'oldName' => (string)$row['old_name'],
+        'newName' => (string)$row['new_name'],
+        'status' => (string)$row['status'],
+        'createdAt' => (string)$row['created_at'],
+    ]]);
+}
+
+function listCharacters(): void
+{
+    if ($_SERVER['REQUEST_METHOD'] !== 'GET') {
+        respond(405, ['message' => 'Dozwolona jest tylko metoda GET.']);
+    }
+    $base = __DIR__ . '/../images/characters';
+    $dirs = @glob($base . '/*', GLOB_ONLYDIR) ?: [];
+    $list = [];
+    foreach ($dirs as $dir) {
+        $name = basename($dir);
+        $frames = @glob($dir . '/*.png') ?: [];
+        $count = count($frames);
+        if ($count === 0) continue;
+        $preview = "images/characters/$name/${name}_0.png";
+        if (!file_exists(__DIR__ . "/../$preview")) {
+            $preview = "images/characters/$name/" . basename($frames[0]);
+        }
+        $zoom = 1.0;
+        $flipX = false;
+        $flipY = false;
+        $offsetX = 0;
+        $offsetY = 0;
+        $cfgPath = $dir . '/config.json';
+        if (file_exists($cfgPath)) {
+            $cfg = @json_decode(@file_get_contents($cfgPath), true);
+            if (is_array($cfg)) {
+                if (isset($cfg['zoom']) && is_numeric($cfg['zoom'])) {
+                    $zoom = (float)$cfg['zoom'];
+                    if ($zoom <= 0) $zoom = 1.0;
+                }
+                if (isset($cfg['flipX'])) $flipX = (bool)$cfg['flipX'];
+                if (isset($cfg['flipY'])) $flipY = (bool)$cfg['flipY'];
+                if (isset($cfg['flip']) && is_array($cfg['flip'])) {
+                    if (isset($cfg['flip']['x'])) $flipX = (bool)$cfg['flip']['x'];
+                    if (isset($cfg['flip']['y'])) $flipY = (bool)$cfg['flip']['y'];
+                    if (isset($cfg['flip']['horizontal'])) $flipX = (bool)$cfg['flip']['horizontal'];
+                    if (isset($cfg['flip']['vertical'])) $flipY = (bool)$cfg['flip']['vertical'];
+                }
+                if (isset($cfg['flipH'])) $flipX = (bool)$cfg['flipH'];
+                if (isset($cfg['flipV'])) $flipY = (bool)$cfg['flipV'];
+                if (isset($cfg['offsetX']) && is_numeric($cfg['offsetX'])) $offsetX = (int)$cfg['offsetX'];
+                if (isset($cfg['offsetY']) && is_numeric($cfg['offsetY'])) $offsetY = (int)$cfg['offsetY'];
+                if (isset($cfg['offset']) && is_array($cfg['offset'])) {
+                    if (isset($cfg['offset']['x']) && is_numeric($cfg['offset']['x'])) $offsetX = (int)$cfg['offset']['x'];
+                    if (isset($cfg['offset']['y']) && is_numeric($cfg['offset']['y'])) $offsetY = (int)$cfg['offset']['y'];
+                }
+            }
+        }
+        $list[] = ['id' => $name, 'name' => ucfirst($name), 'frames' => $count, 'preview' => $preview, 'zoom' => $zoom, 'flipX' => $flipX, 'flipY' => $flipY, 'offsetX' => $offsetX, 'offsetY' => $offsetY];
+    }
+    // oryginalny żółw jako opcja
+    $tZoom = 1.0; $tFlipX = false; $tFlipY = false; $tOffX = 0; $tOffY = 0;
+    $tCfg = __DIR__ . '/../images/characters/turtle/config.json';
+    if (file_exists($tCfg)) {
+        $tc = @json_decode(@file_get_contents($tCfg), true);
+        if (is_array($tc)) {
+            if (isset($tc['zoom']) && is_numeric($tc['zoom']) && (float)$tc['zoom'] > 0) $tZoom = (float)$tc['zoom'];
+            if (isset($tc['flipX'])) $tFlipX = (bool)$tc['flipX'];
+            if (isset($tc['flipY'])) $tFlipY = (bool)$tc['flipY'];
+            if (isset($tc['flip']) && is_array($tc['flip'])) {
+                if (isset($tc['flip']['x'])) $tFlipX = (bool)$tc['flip']['x'];
+                if (isset($tc['flip']['y'])) $tFlipY = (bool)$tc['flip']['y'];
+            }
+            if (isset($tc['offsetX']) && is_numeric($tc['offsetX'])) $tOffX = (int)$tc['offsetX'];
+            if (isset($tc['offsetY']) && is_numeric($tc['offsetY'])) $tOffY = (int)$tc['offsetY'];
+            if (isset($tc['offset']) && is_array($tc['offset'])) {
+                if (isset($tc['offset']['x']) && is_numeric($tc['offset']['x'])) $tOffX = (int)$tc['offset']['x'];
+                if (isset($tc['offset']['y']) && is_numeric($tc['offset']['y'])) $tOffY = (int)$tc['offset']['y'];
+            }
+        }
+    }
+    $list[] = ['id' => 'turtle', 'name' => 'Żółw', 'frames' => 1, 'preview' => null, 'zoom' => $tZoom, 'flipX' => $tFlipX, 'flipY' => $tFlipY, 'offsetX' => $tOffX, 'offsetY' => $tOffY];
+    usort($list, fn($a,$b) => strcmp($a['id'], $b['id']));
+    respond(200, ['characters' => $list]);
+}
+
+function setCharacter(): void
+{
+    $data = readJsonBody();
+    requireCsrfToken();
+    $user = requireSession();
+    $char = trim((string)($data['character'] ?? $data['char'] ?? ''));
+    if ($char === '') {
+        respond(422, ['message' => 'Wybierz postać.']);
+    }
+    $base = __DIR__ . '/../images/characters';
+    $allowed = array_map('basename', @glob($base . '/*', GLOB_ONLYDIR) ?: []);
+    $allowed[] = 'turtle';
+    if (!in_array($char, $allowed, true)) {
+        respond(422, ['message' => 'Nieprawidłowa postać.']);
+    }
+    $stmt = db()->prepare('UPDATE uzytkownicy SET character = :c WHERE id = :id');
+    $stmt->execute(['c' => $char, 'id' => (int)$user['id']]);
+    $updated = requireSession();
+    if (empty($_SESSION['csrf_token'])) {
+        $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
+    }
+    respond(200, ['account' => publicUser($updated), 'csrfToken' => $_SESSION['csrf_token'], 'message' => 'Wybrano postać.']);
 }

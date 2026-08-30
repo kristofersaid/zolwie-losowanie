@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Żółw - test</title>
+<style>
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    display: grid;
+    place-items: center;
+    background: #7fb48e;
+  }
+  .turtle-icon {
+    --turtle-color: #1d9d69;
+    position: relative;
+    display: block;
+    width: 38px;
+    height: 26px;
+    border: 2px solid color-mix(in srgb, var(--turtle-color) 68%, #1a1a1a);
+    border-radius: 48% 52% 45% 45%;
+    background: var(--turtle-color);
+    filter: drop-shadow(0 3px 3px rgba(0,0,0,0.35));
+  }
+  .turtle-icon::before {
+    content: "";
+    position: absolute;
+    top: 4px;
+    right: -7px;
+    width: 10px;
+    height: 10px;
+    border: 2px solid color-mix(in srgb, var(--turtle-color) 68%, #1a1a1a);
+    border-radius: 50%;
+    background: var(--turtle-color);
+  }
+  .turtle-icon::after {
+    content: "";
+    position: absolute;
+    bottom: -5px;
+    left: 4px;
+    width: 6px;
+    height: 7px;
+    border-radius: 50%;
+    background: color-mix(in srgb, var(--turtle-color) 68%, #1a1a1a);
+    box-shadow: 16px 0 color-mix(in srgb, var(--turtle-color) 68%, #1a1a1a);
+  }
+</style>
+</head>
+<body>
+  <span class="turtle-icon" aria-label="Żółw"></span>
+</body>
+</html>

@@ -6,10 +6,18 @@ const authSection = $("#auth-section");
 const accountSection = $("#account-section");
 const teacherInviteSection = $("#teacher-invite-section");
 const teacherStudentsSection = $("#teacher-students-section");
+const teacherNameRequestsSection = $("#teacher-name-requests-section");
 const studentSection = $("#student-section");
+const studentDisplayNameInput = $("#student-display-name");
+const studentSaveNameBtn = $("#student-save-name");
+const studentNameError = $("#student-name-error");
 const loginForm = $("#login-form");
 const registerForm = $("#register-form");
 const regRole = $("#reg-role");
+const regRoleTrigger = $("#reg-role-trigger");
+const regRoleLabel = $("#reg-role-label");
+const regRoleOptions = $("#reg-role-options");
+const regRoleWrap = $("#reg-role-wrap");
 const regTeacherOnly = document.querySelector(".reg-teacher-only");
 const regStudentOnly = document.querySelector(".reg-student-only");
 const toast = $("#toast");
@@ -35,12 +43,46 @@ let pebbleSeqTimer = null;
 let pebbleFinishOrder = 0;
 let pebbleRacing = false;
 let pebbleLastTime = 0;
+let availableCharacters = [];
+let characterFrames = new Map();
+let characterZoom = new Map();
+let characterFlipX = new Map();
+let characterFlipY = new Map();
+let characterOffsetX = new Map();
+let characterOffsetY = new Map();
 
 function showToast(message) {
   toast.textContent = message;
   toast.classList.add("is-visible");
   clearTimeout(showToast._timer);
   showToast._timer = setTimeout(() => toast.classList.remove("is-visible"), 3000);
+}
+
+function copyText(text) {
+  if (navigator.clipboard && window.isSecureContext) {
+    return navigator.clipboard.writeText(text);
+  }
+  return new Promise((resolve, reject) => {
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.setAttribute("readonly", "");
+    ta.style.position = "fixed";
+    ta.style.left = "-9999px";
+    ta.style.top = "0";
+    document.body.appendChild(ta);
+    ta.focus();
+    ta.select();
+    ta.setSelectionRange(0, ta.value.length);
+    try {
+      const ok = document.execCommand("copy");
+      document.body.removeChild(ta);
+      if (ok) resolve();
+      else reject(new Error("execCommand failed"));
+    } catch (err) {
+      try { document.body.removeChild(ta); } catch {}
+      reject(err);
+    }
+  });
 }
 
 function setError(element, message) {
@@ -76,6 +118,9 @@ function applyContent() {
   accountSection.hidden = !loggedIn;
   teacherInviteSection.hidden = !(loggedIn && account.role === "teacher");
   teacherStudentsSection.hidden = !(loggedIn && account.role === "teacher");
+  if (teacherNameRequestsSection) teacherNameRequestsSection.hidden = !(loggedIn && account.role === "teacher");
+  const refreshBtn = document.querySelector("#class-refresh-btn");
+  if (refreshBtn) refreshBtn.hidden = !loggedIn;
   studentSection.hidden = !(loggedIn && account.role === "student");
 
   if (loggedIn) {
@@ -177,15 +222,62 @@ function initPebbleAvailability() {
 }
 
 $("#class-refresh-btn")?.addEventListener("click", async () => {
-  await loadStudents();
-  await loadInvites().catch(() => {});
-  showToast("Listy odświeżone.");
+  const btn = $("#class-refresh-btn");
+  if (btn) btn.disabled = true;
+  try {
+    if (account?.role === "teacher") {
+      await loadStudents();
+      await Promise.all([loadInvites().catch(() => {}), loadNameRequests().catch(() => {}), loadCharacters().catch(()=>{})]);
+      showToast("Listy odświeżone.");
+    } else if (account?.role === "student") {
+      await Promise.all([
+        renderStudentPoints().catch(() => {}),
+        loadMyNameRequest().catch(() => {}),
+        loadCharacters().catch(()=>{}),
+        (async () => {
+          try {
+            const me = await callApi("me", { method: "GET" });
+            if (me.account) {
+              account = me.account;
+              csrfToken = me.csrfToken || csrfToken;
+              const accName = document.querySelector("#account-name");
+              if (accName) accName.textContent = account.fullName || account.login;
+              if (studentDisplayNameInput) studentDisplayNameInput.value = account.fullName;
+            }
+          } catch {}
+        })()
+      ]);
+      showToast("Odświeżono.");
+    } else {
+      showToast("Odświeżono.");
+    }
+  } catch (e) {
+    showToast(e.message || "Nie udało się odświeżyć.");
+  } finally {
+    if (btn) btn.disabled = false;
+  }
 });
+
+let pebbleElements = [];
+let preloadedChars = new Set();
+
+function preloadCharacterFrames() {
+  for (const ch of availableCharacters) {
+    if (ch.id === 'turtle' || preloadedChars.has(ch.id)) continue;
+    preloadedChars.add(ch.id);
+    for (let i = 0; i < ch.frames; i++) {
+      const im = new Image();
+      im.decoding = "async";
+      im.src = `images/characters/${ch.id}/${ch.id}_${i}.png`;
+    }
+  }
+}
 
 function resetPebbleView() {
   stopPebbleRace();
   pebbleFinishOrder = 0;
   pebbleRaceState = [];
+  pebbleElements = [];
   activeStudent = null;
   if (pebbleWinner) { pebbleWinner.hidden = true; pebbleWinner.textContent = ""; }
   const wa = $("#winner-actions");
@@ -194,12 +286,12 @@ function resetPebbleView() {
   if (lessonRandom) lessonRandom.disabled = !hasStudentsForPebble();
 }
 
-function renderPebbleTurtles() {
+function ensurePebbleElements() {
   if (!pebbleTurtles || !pebbleTrack) return;
-  if (pebbleRaceState.length === 0) { pebbleTurtles.replaceChildren(); return; }
   const count = pebbleRaceState.length;
+  if (count === 0) { pebbleTurtles.replaceChildren(); pebbleElements = []; return; }
+  if (pebbleElements.length === count && pebbleTurtles.children.length === count * 2) return;
   const trackH = pebbleTrack.clientHeight || 400;
-  const trackW = pebbleTrack.clientWidth || 1000;
   const turtleH = 26;
   const desiredGap = 50;
   let gap = desiredGap;
@@ -209,34 +301,104 @@ function renderPebbleTurtles() {
   } else gap = 0;
   const totalH = count * turtleH + Math.max(0, count - 1) * gap;
   const startY = (trackH - totalH) / 2;
-  const labels = pebbleRaceState.map((racer, index) => {
+  pebbleTurtles.replaceChildren();
+  pebbleElements = pebbleRaceState.map((racer, index) => {
     const baseTop = startY + index * (turtleH + gap) + turtleH / 2;
     const label = document.createElement("span");
     label.className = "turtle-pebble-label turtle-label-static";
     label.textContent = racer.student.fullName;
     label.style.top = `${baseTop - 10}px`;
-    return label;
-  });
-  const turtles = pebbleRaceState.map((racer, index) => {
-    const baseTop = startY + index * (turtleH + gap) + turtleH / 2;
-    const wave = Math.sin((racer.position / 100) * Math.PI * 3 + index * 0.7) * 6;
     const wrap = document.createElement("div");
-    wrap.className = `turtle-pebble${racer.finished ? " is-finished" : ""}`;
+    wrap.className = "turtle-pebble";
     wrap.style.setProperty("--turtle-color", racer.color);
+    wrap.dataset.index = String(index);
+    const charId = racer.student.character;
+    const isTurtle = !charId || charId === 'turtle';
+    const hasChar = charId && characterFrames.has(charId) && !isTurtle;
+    let imgEl = null;
+    let iconEl = null;
+    if (hasChar) {
+      const img = document.createElement("img");
+      img.className = "racer-char";
+      img.alt = racer.student.fullName;
+      img.decoding = "async";
+      img.loading = "eager";
+      const zoom = characterZoom.get(charId) || 1;
+      const flipX = characterFlipX.get(charId) || false;
+      const flipY = characterFlipY.get(charId) || false;
+      const offX = characterOffsetX.get(charId) || 0;
+      const offY = characterOffsetY.get(charId) || 0;
+      const sx = zoom * (flipX ? -1 : 1);
+      const sy = zoom * (flipY ? -1 : 1);
+      const parts = [];
+      if (offX !== 0 || offY !== 0) parts.push(`translate(${offX}px, ${offY}px)`);
+      if (sx !== 1 || sy !== 1) parts.push(`scale(${sx}, ${sy})`);
+      if (parts.length) { img.style.transform = parts.join(" "); img.style.transformOrigin = "center"; }
+      const charWrap = document.createElement("div");
+      charWrap.className = "racer-char-wrap";
+      charWrap.append(img);
+      wrap.append(charWrap);
+      imgEl = img;
+      // ustaw pierwszą klatkę od razu, bez migania
+      const frames = characterFrames.get(charId) || 1;
+      const fi = Math.floor(Date.now() / 120) % frames;
+      img.src = `images/characters/${charId}/${charId}_${fi}.png`;
+    } else {
+      const icon = document.createElement("span");
+      icon.className = "turtle-icon";
+      icon.style.setProperty("--turtle-color", racer.color);
+      icon.setAttribute("aria-label", racer.student.fullName);
+      if (isTurtle && charId === 'turtle') {
+        const z = characterZoom.get('turtle') || 1;
+        const fx = characterFlipX.get('turtle') || false;
+        const fy = characterFlipY.get('turtle') || false;
+        const ox = characterOffsetX.get('turtle') || 0;
+        const oy = characterOffsetY.get('turtle') || 0;
+        const sxT = z * (fx ? -1 : 1);
+        const syT = z * (fy ? -1 : 1);
+        const partsT = [];
+        if (ox !== 0 || oy !== 0) partsT.push(`translate(${ox}px, ${oy}px)`);
+        if (sxT !== 1 || syT !== 1) partsT.push(`scale(${sxT}, ${syT})`);
+        if (partsT.length) { icon.style.transform = partsT.join(" "); icon.style.transformOrigin = "center"; }
+      }
+      wrap.append(icon);
+      iconEl = icon;
+    }
+    pebbleTurtles.append(label, wrap);
+    return { label, wrap, imgEl, iconEl, baseTop, index };
+  });
+}
+
+function renderPebbleTurtles() {
+  if (!pebbleTurtles || !pebbleTrack) return;
+  if (pebbleRaceState.length === 0) { pebbleTurtles.replaceChildren(); pebbleElements = []; return; }
+  preloadCharacterFrames();
+  ensurePebbleElements();
+  updatePebblePositions();
+}
+
+function updatePebblePositions() {
+  if (pebbleElements.length !== pebbleRaceState.length) return;
+  const now = Date.now();
+  pebbleRaceState.forEach((racer, i) => {
+    const el = pebbleElements[i];
+    if (!el) return;
+    const wave = Math.sin((racer.position / 100) * Math.PI * 3 + i * 0.7) * 6;
     const startPct = 6.5;
     const endPct = 91.54;
     const xPct = startPct + Math.max(0, Math.min(100, racer.position)) / 100 * (endPct - startPct);
-    wrap.style.left = `${xPct}%`;
-    wrap.style.transform = "translateX(-50%)";
-    wrap.style.top = `${baseTop + wave - 13}px`;
-    const icon = document.createElement("span");
-    icon.className = "turtle-icon";
-    icon.style.setProperty("--turtle-color", racer.color);
-    icon.setAttribute("aria-label", racer.student.fullName);
-    wrap.append(icon);
-    return wrap;
+    el.wrap.style.left = `${xPct}%`;
+    el.wrap.style.transform = "translateX(-50%)";
+    el.wrap.style.top = `${el.baseTop + wave - 13}px`;
+    el.wrap.classList.toggle("is-finished", !!racer.finished);
+    if (el.imgEl) {
+      const charId = racer.student.character;
+      const frames = characterFrames.get(charId) || 1;
+      const frameIdx = Math.floor(now / 120 + i * 1.7) % frames;
+      const newSrc = `images/characters/${charId}/${charId}_${frameIdx}.png`;
+      if (el.imgEl.getAttribute("src") !== newSrc) el.imgEl.src = newSrc;
+    }
   });
-  pebbleTurtles.replaceChildren(...labels, ...turtles);
 }
 
 function resetLights() {
@@ -272,6 +434,12 @@ function startPebbleRace() {
   if (pendingContainer) pendingContainer.replaceChildren();
   pebbleFinishOrder = 0;
   resetLights();
+  // ukryj poprzedniego zwycięzcę i przyciski +/-/nb zanim wystartuje kolejny wyścig
+  activeStudent = null;
+  if (pebbleWinner) { pebbleWinner.hidden = true; pebbleWinner.textContent = ""; }
+  const wa = document.querySelector("#winner-actions");
+  if (wa) wa.hidden = true;
+  document.querySelectorAll("[data-winner-mark]").forEach((b) => { b.disabled = false; });
   pebbleRaceState = students.map((student, index) => ({
     student,
     color: raceColors[index % raceColors.length],
@@ -281,7 +449,6 @@ function startPebbleRace() {
     finishedOrder: null,
   }));
   renderPebbleTurtles();
-  if (pebbleWinner) pebbleWinner.hidden = true;
   pebbleRacing = true;
   if (lessonRandom) lessonRandom.disabled = true;
   startLightSequence();
@@ -310,7 +477,7 @@ function animatePebble(now) {
       allFinished = false;
     }
   });
-  renderPebbleTurtles();
+  updatePebblePositions();
   if (allFinished) finishPebbleRace();
   else pebbleRaf = requestAnimationFrame(animatePebble);
 }
@@ -483,6 +650,10 @@ function syncRoleFields() {
   const isStudent = regRole.value === "student";
   regTeacherOnly.hidden = isStudent;
   regStudentOnly.hidden = !isStudent;
+  if (regRoleLabel) regRoleLabel.textContent = regRole.value === "teacher" ? "Nauczyciel" : "Uczeń";
+  if (regRoleOptions) {
+    regRoleOptions.querySelectorAll("li").forEach((li) => li.classList.toggle("is-selected", li.dataset.value === regRole.value));
+  }
 }
 
 async function handleLogin(event) {
@@ -533,8 +704,12 @@ function applySession(data) {
   if (account.role === "teacher") {
     renderTeacherClass();
     loadStudents().catch((error) => showToast(error.message));
+    loadNameRequests().catch(()=>{});
+    loadCharacters().catch(()=>{});
   } else {
     renderStudentPoints().catch((error) => showToast(error.message));
+    loadMyNameRequest().catch(()=>{});
+    loadCharacters().catch(()=>{});
   }
   openMenu();
 }
@@ -544,10 +719,17 @@ function syncUI() {
   if (account.role === "teacher") {
     teacherInviteSection.hidden = false;
     teacherStudentsSection.hidden = false;
+    const nrSection = document.querySelector("#teacher-name-requests-section");
+    if (nrSection) nrSection.hidden = false;
     $("#teacher-class-name").textContent = teacherClass ? teacherClass.name : "";
-    loadClasses().then(() => loadInvites().catch(()=>{})).catch(()=>{});
+    loadClasses().then(() => { loadInvites().catch(()=>{}); loadNameRequests().catch(()=>{}); }).catch(()=>{});
+    loadCharacters().catch(()=>{});
   } else {
     studentSection.hidden = false;
+    if (studentDisplayNameInput) studentDisplayNameInput.value = account.fullName || "";
+    if (studentNameError) studentNameError.hidden = true;
+    loadMyNameRequest().catch(()=>{});
+    loadCharacters().catch(()=>{});
   }
 }
 
@@ -568,6 +750,7 @@ async function handleLogout() {
   resetPebbleView();
   applyContent();
   showToast("Wylogowano.");
+  openMenu();
 }
 
 /* ---------- Events ---------- */
@@ -591,7 +774,10 @@ menuButton.addEventListener("click", openMenu);
 menuClose.addEventListener("click", closeMenu);
 document.querySelector("[data-menu-backdrop]")?.addEventListener("click", closeMenu);
 document.addEventListener("keydown", (event) => {
-  if (event.key === "Escape" && !menuOverlay.hidden) closeMenu();
+  if (event.key !== "Escape") return;
+  if (qrOverlay && !qrOverlay.hidden) { closeQrPopup(); return; }
+  if (document.querySelector("#new-class-overlay") && !$("#new-class-overlay").hidden) { closeNewClassPopup(); return; }
+  if (!menuOverlay.hidden) closeMenu();
 });
 
 lessonRandom?.addEventListener("click", startPebbleRace);
@@ -607,9 +793,93 @@ document.querySelectorAll("[data-auth-tab]").forEach((tab) => {
 
 regRole.addEventListener("change", syncRoleFields);
 
+regRoleTrigger?.addEventListener("click", () => {
+  if (!regRoleOptions || !regRoleTrigger) return;
+  const willOpen = regRoleOptions.hidden;
+  if (willOpen) {
+    regRoleOptions.querySelectorAll("li").forEach((li) => li.classList.toggle("is-selected", li.dataset.value === regRole.value));
+  }
+  regRoleOptions.hidden = !willOpen;
+  regRoleTrigger.setAttribute("aria-expanded", willOpen ? "true" : "false");
+});
+regRoleOptions?.querySelectorAll("li").forEach((li) => {
+  li.addEventListener("click", () => {
+    regRole.value = li.dataset.value;
+    if (regRoleLabel) regRoleLabel.textContent = li.textContent;
+    regRoleOptions.querySelectorAll("li").forEach((el) => el.classList.toggle("is-selected", el === li));
+    regRoleOptions.hidden = true;
+    regRoleTrigger?.setAttribute("aria-expanded", "false");
+    syncRoleFields();
+    regRole.dispatchEvent(new Event("change", { bubbles: true }));
+  });
+});
+
 loginForm.addEventListener("submit", handleLogin);
 registerForm.addEventListener("submit", handleRegister);
 $("#logout-button").addEventListener("click", handleLogout);
+
+async function loadMyNameRequest() {
+  if (!account || account.role !== "student") return;
+  try {
+    const data = await callApi("my-name-request", { method: "GET" });
+    const pending = data.pending;
+    const box = document.querySelector("#student-name-pending");
+    const pendOld = document.querySelector("#student-pending-old");
+    const pendNew = document.querySelector("#student-pending-new");
+    if (pending) {
+      if (box) box.hidden = false;
+      if (pendOld) pendOld.textContent = pending.oldName;
+      if (pendNew) pendNew.textContent = pending.newName;
+      if (studentDisplayNameInput) studentDisplayNameInput.disabled = true;
+      if (studentSaveNameBtn) { studentSaveNameBtn.disabled = true; studentSaveNameBtn.textContent = "Oczekuje..."; }
+      if (studentNameError) studentNameError.hidden = true;
+    } else {
+      if (box) box.hidden = true;
+      if (studentDisplayNameInput) studentDisplayNameInput.disabled = false;
+      if (studentSaveNameBtn) { studentSaveNameBtn.disabled = false; studentSaveNameBtn.textContent = "Zapisz"; }
+      // odśwież konto — mogło zostać zatwierdzone
+      try {
+        const me = await callApi("me", { method: "GET" });
+        if (me.account && me.account.fullName !== account.fullName) {
+          account = me.account;
+          csrfToken = me.csrfToken || csrfToken;
+          const accName = document.querySelector("#account-name");
+          if (accName) accName.textContent = account.fullName || account.login;
+          if (studentDisplayNameInput) studentDisplayNameInput.value = account.fullName;
+          showToast("Nauczyciel zatwierdził nową nazwę: " + account.fullName);
+        }
+      } catch {}
+    }
+  } catch {}
+}
+
+studentSaveNameBtn?.addEventListener("click", async () => {
+  const newName = studentDisplayNameInput?.value?.trim() ?? "";
+  if (!newName) {
+    if (studentNameError) { studentNameError.textContent = "Podaj wyświetlaną nazwę."; studentNameError.hidden = false; }
+    return;
+  }
+  if (studentNameError) studentNameError.hidden = true;
+  studentSaveNameBtn.disabled = true;
+  const origText = studentSaveNameBtn.textContent;
+  studentSaveNameBtn.textContent = "Wysyłanie...";
+  try {
+    const data = await callApi("request-name-change", { method: "POST", body: JSON.stringify({ fullName: newName }) });
+    showToast(data.message || "Wysłano prośbę do nauczyciela.");
+    await loadMyNameRequest();
+  } catch (e) {
+    if (studentNameError) { studentNameError.textContent = e.message; studentNameError.hidden = false; }
+    showToast(e.message);
+    studentSaveNameBtn.disabled = false;
+    studentSaveNameBtn.textContent = origText;
+  }
+});
+studentDisplayNameInput?.addEventListener("keydown", (e) => {
+  if (e.key === "Enter") {
+    e.preventDefault();
+    studentSaveNameBtn?.click();
+  }
+});
 
 async function loadInvites() {
   if (!account || account.role !== "teacher") return;
@@ -651,7 +921,7 @@ async function loadInvites() {
       copy.style.borderColor = "color-mix(in srgb, var(--purple) 42%, var(--line))";
       copy.style.background = "color-mix(in srgb, var(--purple) 7%, var(--surface))";
       copy.addEventListener("click", () => {
-        navigator.clipboard.writeText(row.code).then(
+        copyText(row.code).then(
           () => showToast("Skopiowano " + row.code),
           () => showToast("Nie udało się skopiować.")
         );
@@ -675,12 +945,294 @@ async function loadInvites() {
   } catch (e) {}
 }
 
+async function loadNameRequests() {
+  if (!account || account.role !== "teacher") return;
+  try {
+    const data = await callApi("list-name-requests", { method: "GET" });
+    const requests = data.requests || [];
+    const list = document.querySelector("#name-requests-list");
+    const countBadge = document.querySelector("#name-requests-count");
+    const section = document.querySelector("#teacher-name-requests-section");
+    if (countBadge) countBadge.textContent = requests.length;
+    if (section) section.hidden = false;
+    if (!list) return;
+    if (requests.length === 0) {
+      list.replaceChildren();
+      const p = document.createElement("p");
+      p.className = "pending-empty";
+      p.textContent = "Brak próśb o zmianę nazwy.";
+      list.append(p);
+      return;
+    }
+    list.replaceChildren(...requests.map((req) => {
+      const row = document.createElement("div");
+      row.className = "pending-row";
+      row.style.flexWrap = "wrap";
+      const info = document.createElement("div");
+      info.style.display = "grid";
+      info.style.gap = "2px";
+      const nameLine = document.createElement("div");
+      nameLine.style.fontSize = "13px";
+      const oldSpan = document.createElement("span");
+      oldSpan.textContent = req.oldName;
+      oldSpan.style.textDecoration = "line-through";
+      oldSpan.style.color = "var(--text-soft)";
+      const arrow = document.createElement("span");
+      arrow.textContent = " → ";
+      arrow.style.color = "var(--text-soft)";
+      const newSpan = document.createElement("span");
+      newSpan.textContent = req.newName;
+      newSpan.style.color = "var(--purple)";
+      newSpan.style.fontWeight = "800";
+      nameLine.append(oldSpan, arrow, newSpan);
+      const meta = document.createElement("div");
+      meta.className = "form-hint";
+      meta.textContent = `${req.login} • ${new Date(req.createdAt).toLocaleString("pl-PL")}`;
+      info.append(nameLine, meta);
+      const actions = document.createElement("div");
+      actions.style.display = "flex";
+      actions.style.gap = "6px";
+      actions.style.marginLeft = "auto";
+      const approve = document.createElement("button");
+      approve.className = "student-remove";
+      approve.type = "button";
+      approve.textContent = "Zatwierdź";
+      approve.style.color = "var(--green)";
+      approve.style.borderColor = "color-mix(in srgb, var(--green) 40%, var(--line))";
+      approve.style.background = "color-mix(in srgb, var(--green) 8%, var(--surface))";
+      const reject = document.createElement("button");
+      reject.className = "student-remove";
+      reject.type = "button";
+      reject.textContent = "Odrzuć";
+      approve.addEventListener("click", async () => {
+        approve.disabled = true; reject.disabled = true;
+        try {
+          await callApi("decide-name-request", { method: "POST", body: JSON.stringify({ requestId: req.id, decision: "approve" }) });
+          showToast(`Zatwierdzono: ${req.newName}`);
+          await loadNameRequests();
+          await loadStudents();
+        } catch (e) { showToast(e.message); approve.disabled = false; reject.disabled = false; }
+      });
+      reject.addEventListener("click", async () => {
+        approve.disabled = true; reject.disabled = true;
+        try {
+          await callApi("decide-name-request", { method: "POST", body: JSON.stringify({ requestId: req.id, decision: "reject" }) });
+          showToast("Odrzucono prośbę.");
+          await loadNameRequests();
+        } catch (e) { showToast(e.message); approve.disabled = false; reject.disabled = false; }
+      });
+      actions.append(approve, reject);
+      row.append(info, actions);
+      return row;
+    }));
+  } catch (e) {}
+}
+
+async function loadCharacters() {
+  try {
+    const data = await callApi("list-characters", { method: "GET" });
+    availableCharacters = data.characters || [];
+    characterFrames.clear();
+    characterZoom.clear();
+    characterFlipX.clear();
+    characterFlipY.clear();
+    characterOffsetX.clear();
+    characterOffsetY.clear();
+    availableCharacters.forEach((c) => {
+      characterFrames.set(c.id, c.frames);
+      characterZoom.set(c.id, typeof c.zoom === 'number' ? c.zoom : 1.0);
+      characterFlipX.set(c.id, !!c.flipX);
+      characterFlipY.set(c.id, !!c.flipY);
+      characterOffsetX.set(c.id, typeof c.offsetX === 'number' ? c.offsetX : 0);
+      characterOffsetY.set(c.id, typeof c.offsetY === 'number' ? c.offsetY : 0);
+    });
+    renderCharacterGrid();
+  } catch (e) {}
+}
+
+function renderCharacterGrid() {
+  const grid = document.querySelector("#character-grid");
+  const err = document.querySelector("#character-error");
+  if (!grid) return;
+  if (availableCharacters.length === 0) {
+    grid.replaceChildren();
+    const p = document.createElement("p");
+    p.className = "pending-empty";
+    p.textContent = "Brak postaci.";
+    grid.append(p);
+    return;
+  }
+  const selected = account?.character || null;
+  const effectiveSelected = selected || 'turtle';
+  grid.replaceChildren(...availableCharacters.map((ch) => {
+    const isTurtle = ch.id === 'turtle';
+    const card = document.createElement("button");
+    card.type = "button";
+    card.className = `character-card${effectiveSelected === ch.id ? " is-selected" : ""}`;
+    card.dataset.char = ch.id;
+    card.title = ch.name;
+    let previewEl;
+    if (isTurtle) {
+      const turtle = document.createElement("span");
+      turtle.className = "turtle-icon";
+      turtle.style.setProperty("--turtle-color", "#1d9d69");
+      turtle.style.display = "block";
+      turtle.style.width = "38px";
+      turtle.style.height = "26px";
+      const zoom = ch.zoom || 1;
+      const flipX = !!ch.flipX;
+      const flipY = !!ch.flipY;
+      const offX = ch.offsetX || 0;
+      const offY = ch.offsetY || 0;
+      const sx = zoom * (flipX ? -1 : 1);
+      const sy = zoom * (flipY ? -1 : 1);
+      const parts = [];
+      if (offX !== 0 || offY !== 0) parts.push(`translate(${offX}px, ${offY}px)`);
+      if (sx !== 1 || sy !== 1) parts.push(`scale(${sx}, ${sy})`);
+      if (parts.length) {
+        turtle.style.transform = parts.join(" ");
+        turtle.style.transformOrigin = "center";
+      }
+      const wrap = document.createElement("div");
+      wrap.style.width = "48px";
+      wrap.style.height = "48px";
+      wrap.style.display = "grid";
+      wrap.style.placeItems = "center";
+      wrap.append(turtle);
+      previewEl = wrap;
+    } else {
+      const img = document.createElement("img");
+      img.src = ch.preview;
+      img.alt = ch.name;
+      img.loading = "lazy";
+      const zoom = ch.zoom || 1;
+      const flipX = !!ch.flipX;
+      const flipY = !!ch.flipY;
+      const offX = ch.offsetX || 0;
+      const offY = ch.offsetY || 0;
+      const sx = zoom * (flipX ? -1 : 1);
+      const sy = zoom * (flipY ? -1 : 1);
+      const parts = [];
+      if (offX !== 0 || offY !== 0) parts.push(`translate(${offX}px, ${offY}px)`);
+      if (sx !== 1 || sy !== 1) parts.push(`scale(${sx}, ${sy})`);
+      if (parts.length) {
+        img.style.transform = parts.join(" ");
+        img.style.transformOrigin = "center";
+      }
+      previewEl = img;
+    }
+    const label = document.createElement("span");
+    label.textContent = ch.name;
+    card.append(previewEl, label);
+    card.addEventListener("click", () => selectCharacter(ch.id, card));
+    return card;
+  }));
+  if (err) err.hidden = true;
+}
+
+async function selectCharacter(charId, cardEl) {
+  const err = document.querySelector("#character-error");
+  if (err) err.hidden = true;
+  const prevSelected = document.querySelector(".character-card.is-selected");
+  if (cardEl) {
+    document.querySelectorAll(".character-card").forEach((c) => c.classList.remove("is-selected"));
+    cardEl.classList.add("is-selected");
+  }
+  try {
+    const data = await callApi("set-character", { method: "POST", body: JSON.stringify({ character: charId }) });
+    account = data.account;
+    csrfToken = data.csrfToken || csrfToken;
+    const accName = document.querySelector("#account-name");
+    if (accName) accName.textContent = account.fullName || account.login;
+    showToast(data.message || "Wybrano postać.");
+    // odśwież wyścig jeśli jest widoczny
+    if (hasStudentsForPebble()) {
+      await loadStudents();
+    }
+  } catch (e) {
+    if (prevSelected) {
+      document.querySelectorAll(".character-card").forEach((c) => c.classList.remove("is-selected"));
+      prevSelected.classList.add("is-selected");
+    } else if (cardEl) {
+      cardEl.classList.remove("is-selected");
+    }
+    if (err) { err.textContent = e.message; err.hidden = false; }
+    showToast(e.message);
+  }
+}
+
 $("#generate-invite")?.addEventListener("click", async () => {
   try {
     const data = await callApi("generate-invite", { method: "POST", body: JSON.stringify({}) });
     await loadInvites();
     showToast("Wygenerowano kod jednorazowy: " + data.code);
   } catch (error) { showToast(error.message); }
+});
+
+/* ---------- QR for invite code (wielorazowy, usuwany przy zamknięciu) ---------- */
+const qrOverlay = $("#qr-overlay");
+const qrImage = $("#qr-image");
+const qrCodeText = $("#qr-code-text");
+const qrCanvas = $("#qr-canvas");
+let activeQrCode = null;
+let qrGenerating = false;
+
+function openQrPopup(code) {
+  if (!qrOverlay || !qrCodeText || !qrImage) return;
+  activeQrCode = code;
+  qrCodeText.textContent = code;
+  const url = `${window.location.origin}${window.location.pathname}?code=${encodeURIComponent(code)}`;
+  const encoded = encodeURIComponent(url);
+  qrImage.src = `https://api.qrserver.com/v1/create-qr-code/?size=240x240&data=${encoded}`;
+  qrImage.alt = `Kod QR ${code}`;
+  qrImage.hidden = false;
+  if (qrCanvas) qrCanvas.hidden = true;
+  qrOverlay.hidden = false;
+  qrImage.onerror = () => {
+    qrImage.hidden = true;
+    showToast("Nie udało się załadować QR — skopiuj kod ręcznie.");
+  };
+}
+async function closeQrPopup() {
+  if (!qrOverlay || qrOverlay.hidden) return;
+  const codeToDelete = activeQrCode || qrCodeText?.textContent?.trim() || "";
+  qrOverlay.hidden = true;
+  activeQrCode = null;
+  if (codeToDelete) {
+    try {
+      await callApi("delete-qr-invite", { method: "POST", body: JSON.stringify({ code: codeToDelete }) });
+    } catch (e) {
+      // ignoruj błąd usuwania, kod mógł już być usunięty
+    }
+  }
+}
+
+$("#show-qr-btn")?.addEventListener("click", async () => {
+  if (qrGenerating) return;
+  if (qrOverlay && !qrOverlay.hidden) {
+    await closeQrPopup();
+  }
+  qrGenerating = true;
+  const btn = $("#show-qr-btn");
+  const origText = btn ? btn.textContent : "";
+  if (btn) { btn.disabled = true; btn.textContent = "Generowanie..."; }
+  try {
+    const data = await callApi("generate-qr-invite", { method: "POST", body: JSON.stringify({}) });
+    openQrPopup(data.code);
+  } catch (e) {
+    showToast(e.message);
+  } finally {
+    qrGenerating = false;
+    if (btn) { btn.disabled = false; btn.textContent = "Pokaż kod QR"; }
+  }
+});
+$("#qr-close")?.addEventListener("click", closeQrPopup);
+$("#qr-close-bottom")?.addEventListener("click", closeQrPopup);
+qrOverlay?.querySelector("[data-qr-backdrop]")?.addEventListener("click", closeQrPopup);
+$("#qr-copy-code")?.addEventListener("click", () => {
+  const code = qrCodeText?.textContent?.trim();
+  if (!code) return;
+  copyText(code).then(() => showToast("Skopiowano " + code), () => showToast("Nie udało się skopiować."));
 });
 
 let currentClassId = null;
@@ -740,6 +1292,7 @@ async function loadClasses() {
             if (sel) sel.value = c.id;
             await loadStudents();
             await loadInvites();
+            await loadNameRequests().catch(()=>{});
             initPebbleAvailability();
           });
           return li;
@@ -762,11 +1315,14 @@ $("#class-switcher-trigger")?.addEventListener("click", () => {
   trg.setAttribute("aria-expanded", willOpen ? "true" : "false");
 });
 document.addEventListener("click", (e) => {
-  const wrap = $("#class-switcher-wrap");
-  if (!wrap || wrap.hidden) return;
-  if (!wrap.contains(e.target)) {
+  const classWrap = $("#class-switcher-wrap");
+  if (classWrap && !classWrap.hidden && !classWrap.contains(e.target)) {
     $("#class-switcher-options").hidden = true;
     $("#class-switcher-trigger")?.setAttribute("aria-expanded", "false");
+  }
+  if (regRoleWrap && regRoleOptions && !regRoleOptions.hidden && !regRoleWrap.contains(e.target)) {
+    regRoleOptions.hidden = true;
+    regRoleTrigger?.setAttribute("aria-expanded", "false");
   }
 });
 
@@ -788,6 +1344,7 @@ $("#class-switcher")?.addEventListener("change", async (e) => {
   if (teacherClass) teacherClass.name = sel.textContent;
   await loadStudents();
   await loadInvites();
+  await loadNameRequests().catch(()=>{});
   initPebbleAvailability();
 });
 $("#new-class-submit")?.addEventListener("click", async () => {
@@ -802,18 +1359,62 @@ $("#new-class-submit")?.addEventListener("click", async () => {
   } catch (e) { err.textContent = e.message; err.hidden = false; }
 });
 
+$("#delete-class-btn")?.addEventListener("click", async () => {
+  if (!account || account.role !== "teacher") return;
+  const currentId = currentClassId || teacherClass?.id;
+  const className = teacherClass ? teacherClass.name : (document.querySelector("#teacher-class-name")?.textContent?.trim() || "tę klasę");
+  if (!currentId) {
+    showToast("Brak klasy do usunięcia.");
+    return;
+  }
+  if (!window.confirm(`Czy usunąć klasę "${className}"?`)) return;
+  if (!window.confirm(`Czy na pewno? Tej operacji nie można cofnąć. Zostaną usunięci uczniowie, kody i oceny z klasy "${className}".`)) return;
+  const btn = document.querySelector("#delete-class-btn");
+  if (btn) btn.disabled = true;
+  try {
+    const data = await callApi("delete-class", { method: "POST", body: JSON.stringify({ classId: currentId }) });
+    showToast(data.message || "Usunięto klasę.");
+    location.reload();
+  } catch (e) {
+    showToast(e.message);
+    if (btn) btn.disabled = false;
+  }
+});
+
 const _origCallApi = callApi;
 callApi = async function(action, opts={}) {
   if (account && account.role === "teacher" && currentClassId) {
-    if (["students","list-invites","generate-invite","delete-invite","add-grade","remove-student","pending-grades"].includes(action)) {
+    if (["students","list-invites","generate-invite","generate-qr-invite","delete-invite","delete-qr-invite","add-grade","remove-student","pending-grades","list-name-requests","decide-name-request","delete-class"].includes(action)) {
       opts.query = { ...(opts.query||{}), classId: currentClassId };
-      if (["generate-invite","delete-invite","add-grade","remove-student"].includes(action)) {
+      if (["generate-invite","generate-qr-invite","delete-invite","delete-qr-invite","add-grade","remove-student","decide-name-request","delete-class"].includes(action)) {
         try { const b = JSON.parse(opts.body||"{}"); b.classId = currentClassId; opts.body = JSON.stringify(b); } catch {}
       }
     }
   }
   return _origCallApi(action, opts);
 };
+
+function handleInviteCodeFromUrl() {
+  try {
+    const params = new URLSearchParams(window.location.search);
+    const raw = params.get("code") || params.get("joinKey") || params.get("join_key") || params.get("invite") || params.get("kod");
+    if (!raw) return false;
+    const clean = raw.trim().toUpperCase();
+    if (!clean || !/^[A-Z0-9]{4,24}$/.test(clean)) return false;
+    document.querySelectorAll("[data-auth-tab]").forEach((t) => t.classList.toggle("is-active", t.dataset.authTab === "register"));
+    if (loginForm) loginForm.hidden = true;
+    if (registerForm) registerForm.hidden = false;
+    if (regRole) {
+      regRole.value = "student";
+      syncRoleFields();
+    }
+    const joinInput = document.querySelector("#reg-join-key");
+    if (joinInput) joinInput.value = clean;
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
 
 /* ---------- Init ---------- */
 
@@ -827,17 +1428,38 @@ async function init() {
     currentClassId = teacherClass ? teacherClass.id : null;
     applyContent();
     syncUI();
+    if (!account) {
+      openMenu();
+      handleInviteCodeFromUrl();
+      initPebbleAvailability();
+      return;
+    }
     if (account.role === "teacher") {
       renderTeacherClass();
       await loadStudents();
+      await loadNameRequests().catch(()=>{});
+      await loadCharacters().catch(()=>{});
     } else {
       await renderStudentPoints().catch(() => {});
+      await loadMyNameRequest().catch(()=>{});
+      await loadCharacters().catch(()=>{});
       initPebbleAvailability();
     }
   } catch (error) {
     applyContent();
     initPebbleAvailability();
+    openMenu();
+    handleInviteCodeFromUrl();
   }
 }
 
 init();
+
+setInterval(() => {
+  if (!account) return;
+  if (account.role === "teacher" && !document.querySelector("#teacher-name-requests-section")?.hidden) {
+    loadNameRequests().catch(()=>{});
+  } else if (account.role === "student" && !document.querySelector("#student-section")?.hidden) {
+    loadMyNameRequest().catch(()=>{});
+  }
+}, 12000);
